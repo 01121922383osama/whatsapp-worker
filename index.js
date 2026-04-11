@@ -213,6 +213,58 @@ function scheduleReconnectSend (tenantId, delayMs, closeMeta) {
 }
 
 /**
+ * After QR / pair handshake, WA often closes with restartRequired (515). Pairing mode must
+ * reopen the socket or pairing never completes (stream errored / restart required in logs).
+ */
+function scheduleReconnectPairing (tenantId, delayMs, closeMeta) {
+  logger.info(
+    {
+      tenantId,
+      delayMs,
+      lastCloseCode: closeMeta?.code,
+      lastCloseReason: closeMeta?.reasonLabel
+    },
+    '[wa-worker] scheduling reconnect (pairing mode, restartRequired)'
+  )
+  setTimeout(() => {
+    void (async () => {
+      if (tenantSockets.has(tenantId)) {
+        logger.debug({ tenantId }, '[wa-worker] pairing reconnect skipped — socket already exists')
+        return
+      }
+      const { data: row, error } = await supabase
+        .from('whatsapp_sessions')
+        .select('pairing_requested_at')
+        .eq('tenant_id', tenantId)
+        .eq('label', SESSION_LABEL)
+        .maybeSingle()
+      if (error) {
+        logger.warn(
+          { tenantId, err: error.message },
+          '[wa-worker] pairing reconnect skipped — session read failed'
+        )
+        return
+      }
+      if (!row?.pairing_requested_at) {
+        logger.info(
+          { tenantId },
+          '[wa-worker] pairing reconnect skipped — pairing no longer requested'
+        )
+        return
+      }
+      try {
+        await startSocket(tenantId, { mode: 'pairing' })
+      } catch (e) {
+        logger.error(
+          { tenantId, err: e instanceof Error ? e.message : String(e) },
+          '[wa-worker] reconnect pairing failed'
+        )
+      }
+    })()
+  }, delayMs)
+}
+
+/**
  * @param {string} tenantId
  * @param {{ mode: 'send' | 'pairing' }} ctx
  */
@@ -327,9 +379,13 @@ async function startSocket (tenantId, ctx) {
       })
 
       if (ctx.mode === 'pairing') {
+        if (code === DisconnectReason.restartRequired) {
+          scheduleReconnectPairing(tenantId, 500, { code, reasonLabel })
+          return
+        }
         logger.info(
           { tenantId, code, reasonLabel, msg: msg.slice(0, 200) },
-          '[wa-worker] pairing socket closed (no auto-reconnect in pairing mode)'
+          '[wa-worker] pairing socket closed (no auto-reconnect for this close code)'
         )
         return
       }
