@@ -1,14 +1,14 @@
 /**
- * Baileys worker — reads `whatsapp_queue` from Supabase.
+ * Multi-tenant Baileys worker — reads `whatsapp_queue` and `whatsapp_sessions` from Supabase.
  *
- * Env: Railway/host vars, or dotenv from (in order, each overrides previous):
- *   ../../.env.local (monorepo root, local dev), ./.env.local, ./.env
+ * Auth files live at `auth_info_baileys/<tenant_id>/` (one WhatsApp account per academy).
+ * Legacy single-folder auth: move `auth_info_baileys/*` into `auth_info_baileys/<your-tenant-uuid>/`.
  *
- * Logging: set WA_WORKER_LOG_LEVEL=info|debug|warn (default info).
- * Debug shows full message bodies; info truncates body preview.
+ * Env: see README.md
  */
 import { config as loadEnv } from 'dotenv'
 import { existsSync } from 'fs'
+import { rm } from 'fs/promises'
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
 
@@ -30,7 +30,6 @@ import makeWASocket, {
   useMultiFileAuthState
 } from '@whiskeysockets/baileys'
 import pino from 'pino'
-import qrcode from 'qrcode-terminal'
 
 const logLevel = (process.env.WA_WORKER_LOG_LEVEL || 'info').trim().toLowerCase()
 const logBodies = logLevel === 'debug'
@@ -42,18 +41,33 @@ const logger = pino({
 const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').trim()
 const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim()
 const pollMs = Number(process.env.WORKER_POLL_MS) || 8000
+const sessionPollMs = Number(process.env.WORKER_SESSION_POLL_MS) || 2500
 
 if (!url || !key) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
   process.exit(1)
 }
 
-logger.info({ pollMs }, '[wa-worker] starting')
+logger.info({ pollMs, sessionPollMs }, '[wa-worker] starting')
 
 const supabase = createClient(url, key)
 
-/** Resolves to the current socket; updated on every reconnect */
-const socketRef = { promise: null }
+const SESSION_LABEL = 'default'
+const authRoot = resolve(__dirname, 'auth_info_baileys')
+
+/** @type {Map<string, string>} last pairing_requested_at ISO we started handling */
+const pairingHandled = new Map()
+
+function tenantAuthDir (tenantId) {
+  return resolve(authRoot, tenantId)
+}
+
+function hasPersistedCreds (tenantId) {
+  return existsSync(resolve(tenantAuthDir(tenantId), 'creds.json'))
+}
+
+/** @type {Map<string, { sock: any }>} */
+const tenantSockets = new Map()
 
 function previewBody (text, max = 160) {
   const s = String(text ?? '')
@@ -62,10 +76,290 @@ function previewBody (text, max = 160) {
   return `${s.slice(0, max)}…`
 }
 
+async function updateSession (tenantId, patch) {
+  const { error } = await supabase
+    .from('whatsapp_sessions')
+    .update({
+      ...patch,
+      updated_at: new Date().toISOString()
+    })
+    .eq('tenant_id', tenantId)
+    .eq('label', SESSION_LABEL)
+  if (error) {
+    logger.error({ tenantId, err: error.message }, '[wa-worker] session update failed')
+  }
+}
+
+async function destroyTenantSocket (tenantId) {
+  const ent = tenantSockets.get(tenantId)
+  if (!ent?.sock) {
+    tenantSockets.delete(tenantId)
+    return
+  }
+  try {
+    ent.sock.end(undefined)
+  } catch (e) {
+    logger.warn(
+      { tenantId, err: e instanceof Error ? e.message : String(e) },
+      '[wa-worker] socket end'
+    )
+  }
+  tenantSockets.delete(tenantId)
+}
+
+async function processLogout (tenantId) {
+  logger.info({ tenantId }, '[wa-worker] processing logout')
+  const ent = tenantSockets.get(tenantId)
+  if (ent?.sock) {
+    try {
+      await ent.sock.logout()
+    } catch (e) {
+      logger.warn(
+        { tenantId, err: e instanceof Error ? e.message : String(e) },
+        '[wa-worker] logout()'
+      )
+    }
+  }
+  tenantSockets.delete(tenantId)
+  pairingHandled.delete(tenantId)
+  try {
+    await rm(tenantAuthDir(tenantId), { recursive: true, force: true })
+  } catch (e) {
+    logger.warn(
+      { tenantId, err: e instanceof Error ? e.message : String(e) },
+      '[wa-worker] rm auth dir'
+    )
+  }
+  await updateSession(tenantId, {
+    status: 'disconnected',
+    linked_wa_jid: null,
+    pairing_qr: null,
+    pairing_requested_at: null,
+    logout_requested_at: null,
+    last_error: null
+  })
+}
+
+function scheduleReconnectSend (tenantId, delayMs) {
+  setTimeout(() => {
+    if (!hasPersistedCreds(tenantId)) return
+    if (tenantSockets.has(tenantId)) return
+    startSocket(tenantId, { mode: 'send' }).catch((e) => {
+      logger.error(
+        { tenantId, err: e instanceof Error ? e.message : String(e) },
+        '[wa-worker] reconnect send failed'
+      )
+    })
+  }, delayMs)
+}
+
 /**
- * Resolve queue recipient to a WhatsApp JID.
- * @returns {{ jid: string, resolution: string, meta?: Record<string, unknown> }}
+ * @param {string} tenantId
+ * @param {{ mode: 'send' | 'pairing' }} ctx
  */
+async function startSocket (tenantId, ctx) {
+  await destroyTenantSocket(tenantId)
+
+  const { version, isLatest } = await fetchLatestBaileysVersion()
+  if (!isLatest) {
+    logger.warn({ version, tenantId }, '[wa-worker] Using fetched WA version (not marked latest)')
+  }
+
+  const authDir = tenantAuthDir(tenantId)
+  const { state, saveCreds } = await useMultiFileAuthState(authDir)
+  const sock = makeWASocket({
+    logger: pino({ level: 'warn' }),
+    version,
+    auth: state
+  })
+
+  tenantSockets.set(tenantId, { sock })
+
+  sock.ev.on('creds.update', saveCreds)
+  sock.ev.on('connection.update', (u) => {
+    const { connection, lastDisconnect, qr } = u
+
+    if (qr) {
+      void updateSession(tenantId, {
+        pairing_qr: qr,
+        status: 'pairing',
+        last_error: null
+      })
+      logger.info({ tenantId }, '[wa-worker] QR updated (scan in admin settings)')
+    }
+
+    if (connection === 'open') {
+      const wid = sock.user?.id ?? null
+      logger.info({ tenantId, loggedInJid: wid }, '[wa-worker] WhatsApp connected')
+      pairingHandled.delete(tenantId)
+      void updateSession(tenantId, {
+        status: 'connected',
+        linked_wa_jid: wid,
+        pairing_qr: null,
+        pairing_requested_at: null,
+        last_error: null,
+        worker_checked_at: new Date().toISOString()
+      })
+    }
+
+    if (connection === 'close') {
+      const err = lastDisconnect?.error
+      const code = err?.output?.statusCode
+      const msg = err?.message ?? String(err ?? '')
+      logger.warn({ tenantId, code, msg }, '[wa-worker] connection closed')
+
+      const loggedOut = code === DisconnectReason.loggedOut
+      tenantSockets.delete(tenantId)
+
+      if (loggedOut) {
+        pairingHandled.delete(tenantId)
+        void rm(tenantAuthDir(tenantId), { recursive: true, force: true }).catch(() => {})
+        void updateSession(tenantId, {
+          status: 'disconnected',
+          linked_wa_jid: null,
+          pairing_qr: null,
+          pairing_requested_at: null,
+          last_error: 'logged_out'
+        })
+        return
+      }
+
+      void updateSession(tenantId, {
+        last_error: msg.slice(0, 500),
+        worker_checked_at: new Date().toISOString()
+      })
+
+      if (ctx.mode === 'pairing') {
+        return
+      }
+
+      const delayMs =
+        code === DisconnectReason.restartRequired ? 500 : 3000
+      scheduleReconnectSend(tenantId, delayMs)
+    }
+  })
+
+  return sock
+}
+
+async function pollSessions () {
+  try {
+    const { data: rows, error } = await supabase
+      .from('whatsapp_sessions')
+      .select('*')
+      .eq('label', SESSION_LABEL)
+
+    if (error) {
+      logger.error({ err: error.message }, '[wa-worker] session poll query failed')
+      return
+    }
+
+    for (const row of rows ?? []) {
+      const tid = row.tenant_id
+      if (row.logout_requested_at) {
+        await processLogout(tid)
+        continue
+      }
+
+      if (row.pairing_requested_at) {
+        const prev = pairingHandled.get(tid)
+        if (prev !== row.pairing_requested_at) {
+          pairingHandled.set(tid, row.pairing_requested_at)
+          const meta =
+            row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
+              ? { ...row.metadata }
+              : {}
+          if (meta.wa_force_new_pair === true) {
+            await destroyTenantSocket(tid)
+            try {
+              await rm(tenantAuthDir(tid), { recursive: true, force: true })
+            } catch (e) {
+              logger.warn(
+                { tid, err: e instanceof Error ? e.message : String(e) },
+                '[wa-worker] rm auth for force pair'
+              )
+            }
+            delete meta.wa_force_new_pair
+            await updateSession(tid, { metadata: meta })
+          }
+          logger.info({ tid }, '[wa-worker] starting pairing socket')
+          try {
+            await startSocket(tid, { mode: 'pairing' })
+          } catch (e) {
+            logger.error(
+              { tid, err: e instanceof Error ? e.message : String(e) },
+              '[wa-worker] pairing start failed'
+            )
+            await updateSession(tid, {
+              last_error: e instanceof Error ? e.message.slice(0, 500) : String(e).slice(0, 500)
+            })
+          }
+        }
+      } else {
+        if (!row.pairing_requested_at && tenantSockets.has(tid)) {
+          const ent = tenantSockets.get(tid)
+          if (!ent?.sock?.user && !hasPersistedCreds(tid)) {
+            await destroyTenantSocket(tid)
+            pairingHandled.delete(tid)
+            await updateSession(tid, {
+              pairing_qr: null,
+              status: row.linked_wa_jid ? 'connected' : 'disconnected'
+            })
+            continue
+          }
+        }
+        if (
+          hasPersistedCreds(tid) &&
+          !tenantSockets.has(tid) &&
+          !row.pairing_requested_at
+        ) {
+          try {
+            await startSocket(tid, { mode: 'send' })
+          } catch (e) {
+            logger.error(
+              { tid, err: e instanceof Error ? e.message : String(e) },
+              '[wa-worker] background reconnect failed'
+            )
+          }
+        }
+      }
+    }
+
+    const tick = new Date().toISOString()
+    for (const row of rows ?? []) {
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ worker_checked_at: tick })
+        .eq('tenant_id', row.tenant_id)
+        .eq('label', SESSION_LABEL)
+    }
+  } catch (e) {
+    logger.error(
+      { err: e instanceof Error ? e.message : String(e) },
+      '[wa-worker] session poll error'
+    )
+  }
+}
+
+async function getSockForSend (tenantId) {
+  if (!hasPersistedCreds(tenantId)) {
+    throw new Error('whatsapp_not_linked')
+  }
+  let ent = tenantSockets.get(tenantId)
+  if (ent?.sock?.user) {
+    return ent.sock
+  }
+  if (!ent?.sock) {
+    await startSocket(tenantId, { mode: 'send' })
+  }
+  for (let i = 0; i < 150; i++) {
+    await new Promise((r) => setTimeout(r, 100))
+    const s = tenantSockets.get(tenantId)?.sock
+    if (s?.user) return s
+  }
+  throw new Error('whatsapp_not_ready')
+}
+
 async function resolveRecipientJid (sock, recipientRaw) {
   const wa = String(recipientRaw ?? '').trim()
   if (!wa) {
@@ -98,10 +392,7 @@ async function resolveRecipientJid (sock, recipientRaw) {
       )
       throw new Error(`group_not_found:${wanted}`)
     }
-    logger.info(
-      { jid: hit.id, subject: hit.subject, wanted },
-      '[wa-worker] group resolved'
-    )
+    logger.info({ jid: hit.id, subject: hit.subject, wanted }, '[wa-worker] group resolved')
     return {
       jid: hit.id,
       resolution: 'group_by_name',
@@ -117,62 +408,9 @@ async function resolveRecipientJid (sock, recipientRaw) {
   return { jid, resolution: 'phone_digits', meta: { digits } }
 }
 
-async function buildSock () {
-  const { version, isLatest } = await fetchLatestBaileysVersion()
-  if (!isLatest) {
-    logger.warn({ version }, '[wa-worker] Using fetched WA version (not marked latest)')
-  }
-
-  const authDir = resolve(__dirname, 'auth_info_baileys')
-  const { state, saveCreds } = await useMultiFileAuthState(authDir)
-  const sock = makeWASocket({
-    logger: pino({ level: 'warn' }),
-    version,
-    auth: state,
-    printQRInTerminal: false
-  })
-
-  sock.ev.on('creds.update', saveCreds)
-  sock.ev.on('connection.update', (u) => {
-    const { connection, lastDisconnect, qr } = u
-    if (qr) qrcode.generate(qr, { small: true })
-    if (connection === 'open') {
-      const wid = sock.user?.id ?? null
-      logger.info(
-        { loggedInJid: wid },
-        '[wa-worker] WhatsApp connected — this JID is the sending account (compare with your phone)'
-      )
-    }
-    if (connection === 'close') {
-      const err = lastDisconnect?.error
-      const code = err?.output?.statusCode
-      const msg = err?.message ?? String(err ?? '')
-      logger.warn({ code, msg }, '[wa-worker] connection closed')
-
-      const loggedOut = code === DisconnectReason.loggedOut
-      if (loggedOut) {
-        logger.error(
-          '[wa-worker] Logged out. Delete folder auth_info_baileys and scan QR again.'
-        )
-        return
-      }
-
-      const delayMs =
-        code === DisconnectReason.restartRequired ? 500 : 3000
-      logger.warn({ delayMs }, '[wa-worker] reconnecting')
-      setTimeout(() => {
-        socketRef.promise = buildSock()
-      }, delayMs)
-    }
-  })
-
-  return sock
-}
-
-socketRef.promise = buildSock()
-
 async function sendOnce (row) {
-  const s = await socketRef.promise
+  const tenantId = row.tenant_id
+  const s = await getSockForSend(tenantId)
   const queueId = row.id
   const messageType = row.message_type ?? '(unknown)'
 
@@ -180,7 +418,7 @@ async function sendOnce (row) {
     {
       queueId,
       messageType,
-      tenantId: row.tenant_id,
+      tenantId,
       recipientRaw: row.recipient_phone,
       recipientType: row.recipient_type,
       retryCount: row.retry_count ?? 0,
@@ -189,22 +427,13 @@ async function sendOnce (row) {
     '[wa-worker] dequeue — about to send'
   )
 
-  const { jid, resolution, meta } = await resolveRecipientJid(
-    s,
-    row.recipient_phone
-  )
+  const { jid, resolution, meta } = await resolveRecipientJid(s, row.recipient_phone)
 
-  logger.info(
-    { queueId, jid, resolution, ...meta },
-    '[wa-worker] resolved JID'
-  )
+  logger.info({ queueId, jid, resolution, ...meta }, '[wa-worker] resolved JID')
 
   await s.sendMessage(jid, { text: String(row.message_body ?? '') })
 
-  logger.info(
-    { queueId, jid, messageType, resolution },
-    '[wa-worker] sendMessage OK'
-  )
+  logger.info({ queueId, jid, messageType, resolution }, '[wa-worker] sendMessage OK')
 }
 
 async function pollLoop () {
@@ -273,11 +502,19 @@ async function pollLoop () {
         }
       }
     } catch (e) {
-      logger.error({ err: e instanceof Error ? e.message : String(e) }, '[wa-worker] poll loop error')
+      logger.error(
+        { err: e instanceof Error ? e.message : String(e) },
+        '[wa-worker] poll loop error'
+      )
     }
     await new Promise((r) => setTimeout(r, pollMs))
   }
 }
+
+setInterval(() => {
+  void pollSessions()
+}, sessionPollMs)
+void pollSessions()
 
 pollLoop().catch((e) => {
   logger.fatal({ err: e instanceof Error ? e.message : String(e) }, '[wa-worker] fatal')
