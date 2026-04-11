@@ -12,7 +12,19 @@ From the **repo root** `.env.local` (loaded automatically on `npm start`):
 Optional:
 
 - `WORKER_POLL_MS` — poll interval ms, default `8000`
+- `WORKER_SESSION_POLL_MS` — how often to read `whatsapp_sessions`, default `2500`
 - `WA_WORKER_LOG_LEVEL` — `info` (default), `debug`, or `warn`
+
+### Debugging logs
+
+Set **`WA_WORKER_LOG_LEVEL=debug`** on Railway (or in `.env.local`) to get:
+
+- Baileys internal logs at `debug` (websocket / stream detail)
+- Every `connection.update` (connection state, QR length — not the raw QR string)
+- Session poll row counts and “still waiting for socket” progress
+- Full disconnect **stack traces** and extra Boom payload when a stream errors
+
+At **`info`** (default) you still get: startup config (host + paths), disconnect **code + reason name** (e.g. `restartRequired`), reconnect scheduling, pairing vs send mode, queue send failures with `queueId`, and Supabase errors (`message`, `code`, `details`) when queries/updates fail.
 
 ## Run
 
@@ -32,7 +44,5 @@ npm start
 **Pairing:** use **Admin → Settings → WhatsApp** for that academy: “Show QR code to link WhatsApp”. The worker writes the QR into Supabase; scan it with WhatsApp → Linked devices. Persist the **`auth_info_baileys`** directory (or a Railway volume mounted there) across deploys.
 
 **Legacy single-folder auth:** if you previously had `auth_info_baileys/creds.json` at the root, move the whole contents into **`auth_info_baileys/<your-tenant-uuid>/`** (get `tenant_id` from Supabase `tenants`).
-
-Optional env: **`WORKER_SESSION_POLL_MS`** (default `2500`) — how often to sync `whatsapp_sessions`.
 
 If you see **`connection closed` with code `405`**: update dependencies (`npm install`), ensure this worker uses **`fetchLatestBaileysVersion`** (already in `index.js`), then delete that tenant’s folder under **`auth_info_baileys/<tenant_id>/`** and pair again.

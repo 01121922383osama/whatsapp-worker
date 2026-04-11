@@ -33,10 +33,30 @@ import pino from 'pino'
 
 const logLevel = (process.env.WA_WORKER_LOG_LEVEL || 'info').trim().toLowerCase()
 const logBodies = logLevel === 'debug'
+const logDebug = logLevel === 'debug'
 
 const logger = pino({
   level: logLevel === 'debug' ? 'debug' : logLevel === 'warn' ? 'warn' : 'info'
 })
+
+/** Human-readable Baileys disconnect code (see DisconnectReason in @whiskeysockets/baileys) */
+function disconnectReasonLabel (code) {
+  if (code === undefined || code === null || Number.isNaN(code)) {
+    return 'unknown'
+  }
+  for (const [name, value] of Object.entries(DisconnectReason)) {
+    if (typeof value === 'number' && value === code) return name
+  }
+  return `code_${code}`
+}
+
+function supabaseHostHint () {
+  try {
+    return new URL(url).host
+  } catch {
+    return '(invalid url)'
+  }
+}
 
 const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').trim()
 const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim()
@@ -48,7 +68,16 @@ if (!url || !key) {
   process.exit(1)
 }
 
-logger.info({ pollMs, sessionPollMs }, '[wa-worker] starting')
+logger.info(
+  {
+    pollMs,
+    sessionPollMs,
+    logLevel,
+    supabaseHost: supabaseHostHint(),
+    authRoot
+  },
+  '[wa-worker] starting'
+)
 
 const supabase = createClient(url, key)
 
@@ -77,7 +106,7 @@ function previewBody (text, max = 160) {
 }
 
 async function updateSession (tenantId, patch) {
-  const { error } = await supabase
+  const { error, data } = await supabase
     .from('whatsapp_sessions')
     .update({
       ...patch,
@@ -85,8 +114,23 @@ async function updateSession (tenantId, patch) {
     })
     .eq('tenant_id', tenantId)
     .eq('label', SESSION_LABEL)
+    .select('id')
+    .maybeSingle()
   if (error) {
-    logger.error({ tenantId, err: error.message }, '[wa-worker] session update failed')
+    logger.error(
+      {
+        tenantId,
+        err: error.message,
+        code: error.code,
+        details: error.details,
+        hint: error.hint
+      },
+      '[wa-worker] session update failed'
+    )
+    return
+  }
+  if (logDebug && data) {
+    logger.debug({ tenantId, keys: Object.keys(patch) }, '[wa-worker] session row updated')
   }
 }
 
@@ -140,10 +184,25 @@ async function processLogout (tenantId) {
   })
 }
 
-function scheduleReconnectSend (tenantId, delayMs) {
+function scheduleReconnectSend (tenantId, delayMs, closeMeta) {
+  logger.info(
+    {
+      tenantId,
+      delayMs,
+      lastCloseCode: closeMeta?.code,
+      lastCloseReason: closeMeta?.reasonLabel
+    },
+    '[wa-worker] scheduling reconnect (send mode)'
+  )
   setTimeout(() => {
-    if (!hasPersistedCreds(tenantId)) return
-    if (tenantSockets.has(tenantId)) return
+    if (!hasPersistedCreds(tenantId)) {
+      logger.warn({ tenantId }, '[wa-worker] reconnect skipped — no creds on disk')
+      return
+    }
+    if (tenantSockets.has(tenantId)) {
+      logger.debug({ tenantId }, '[wa-worker] reconnect skipped — socket already exists')
+      return
+    }
     startSocket(tenantId, { mode: 'send' }).catch((e) => {
       logger.error(
         { tenantId, err: e instanceof Error ? e.message : String(e) },
@@ -166,9 +225,14 @@ async function startSocket (tenantId, ctx) {
   }
 
   const authDir = tenantAuthDir(tenantId)
+  if (logDebug) {
+    logger.debug({ tenantId, authDir, mode: ctx.mode }, '[wa-worker] useMultiFileAuthState')
+  }
   const { state, saveCreds } = await useMultiFileAuthState(authDir)
   const sock = makeWASocket({
-    logger: pino({ level: 'warn' }),
+    logger: pino({
+      level: logDebug ? 'debug' : 'warn'
+    }),
     version,
     auth: state
   })
@@ -179,13 +243,29 @@ async function startSocket (tenantId, ctx) {
   sock.ev.on('connection.update', (u) => {
     const { connection, lastDisconnect, qr } = u
 
+    if (logDebug) {
+      logger.debug(
+        {
+          tenantId,
+          mode: ctx.mode,
+          connection: connection ?? null,
+          hasQr: Boolean(qr),
+          qrLen: qr ? String(qr).length : 0
+        },
+        '[wa-worker] connection.update'
+      )
+    }
+
     if (qr) {
       void updateSession(tenantId, {
         pairing_qr: qr,
         status: 'pairing',
         last_error: null
       })
-      logger.info({ tenantId }, '[wa-worker] QR updated (scan in admin settings)')
+      logger.info(
+        { tenantId, qrPayloadChars: String(qr).length },
+        '[wa-worker] QR written to DB (scan in admin settings)'
+      )
     }
 
     if (connection === 'open') {
@@ -206,7 +286,23 @@ async function startSocket (tenantId, ctx) {
       const err = lastDisconnect?.error
       const code = err?.output?.statusCode
       const msg = err?.message ?? String(err ?? '')
-      logger.warn({ tenantId, code, msg }, '[wa-worker] connection closed')
+      const reasonLabel = disconnectReasonLabel(code)
+      const boomData = err?.data
+      logger.warn(
+        {
+          tenantId,
+          mode: ctx.mode,
+          code,
+          reasonLabel,
+          msg,
+          boomData: logDebug ? boomData : undefined,
+          disconnectAt: lastDisconnect?.date
+        },
+        '[wa-worker] connection closed'
+      )
+      if (logDebug && err?.stack) {
+        logger.debug({ tenantId, stack: err.stack }, '[wa-worker] close error stack')
+      }
 
       const loggedOut = code === DisconnectReason.loggedOut
       tenantSockets.delete(tenantId)
@@ -221,6 +317,7 @@ async function startSocket (tenantId, ctx) {
           pairing_requested_at: null,
           last_error: 'logged_out'
         })
+        logger.warn({ tenantId }, '[wa-worker] logged out — creds cleared from disk')
         return
       }
 
@@ -230,12 +327,16 @@ async function startSocket (tenantId, ctx) {
       })
 
       if (ctx.mode === 'pairing') {
+        logger.info(
+          { tenantId, code, reasonLabel, msg: msg.slice(0, 200) },
+          '[wa-worker] pairing socket closed (no auto-reconnect in pairing mode)'
+        )
         return
       }
 
       const delayMs =
         code === DisconnectReason.restartRequired ? 500 : 3000
-      scheduleReconnectSend(tenantId, delayMs)
+      scheduleReconnectSend(tenantId, delayMs, { code, reasonLabel })
     }
   })
 
@@ -250,8 +351,15 @@ async function pollSessions () {
       .eq('label', SESSION_LABEL)
 
     if (error) {
-      logger.error({ err: error.message }, '[wa-worker] session poll query failed')
+      logger.error(
+        { err: error.message, code: error.code, details: error.details },
+        '[wa-worker] session poll query failed'
+      )
       return
+    }
+
+    if (logDebug) {
+      logger.debug({ sessionRowCount: rows?.length ?? 0 }, '[wa-worker] session poll tick')
     }
 
     for (const row of rows ?? []) {
@@ -327,11 +435,21 @@ async function pollSessions () {
 
     const tick = new Date().toISOString()
     for (const row of rows ?? []) {
-      await supabase
+      const { error: tickErr } = await supabase
         .from('whatsapp_sessions')
         .update({ worker_checked_at: tick })
         .eq('tenant_id', row.tenant_id)
         .eq('label', SESSION_LABEL)
+      if (tickErr) {
+        logger.error(
+          {
+            tenantId: row.tenant_id,
+            err: tickErr.message,
+            code: tickErr.code
+          },
+          '[wa-worker] worker_checked_at heartbeat failed'
+        )
+      }
     }
   } catch (e) {
     logger.error(
@@ -343,6 +461,7 @@ async function pollSessions () {
 
 async function getSockForSend (tenantId) {
   if (!hasPersistedCreds(tenantId)) {
+    logger.warn({ tenantId }, '[wa-worker] getSockForSend — whatsapp_not_linked (no creds.json)')
     throw new Error('whatsapp_not_linked')
   }
   let ent = tenantSockets.get(tenantId)
@@ -350,13 +469,26 @@ async function getSockForSend (tenantId) {
     return ent.sock
   }
   if (!ent?.sock) {
+    logger.info({ tenantId }, '[wa-worker] getSockForSend — starting send-mode socket')
     await startSocket(tenantId, { mode: 'send' })
   }
   for (let i = 0; i < 150; i++) {
     await new Promise((r) => setTimeout(r, 100))
     const s = tenantSockets.get(tenantId)?.sock
-    if (s?.user) return s
+    if (s?.user) {
+      if (logDebug && i > 0) {
+        logger.debug({ tenantId, waitIterations: i + 1 }, '[wa-worker] socket ready after wait')
+      }
+      return s
+    }
+    if (logDebug && i > 0 && i % 30 === 0) {
+      logger.debug({ tenantId, waitIterations: i + 1 }, '[wa-worker] still waiting for socket user')
+    }
   }
+  logger.error(
+    { tenantId, waitedMs: 150 * 100 },
+    '[wa-worker] getSockForSend — whatsapp_not_ready (timeout)'
+  )
   throw new Error('whatsapp_not_ready')
 }
 
@@ -449,7 +581,10 @@ async function pollLoop () {
         .limit(5)
 
       if (error) {
-        logger.error({ err: error.message }, '[wa-worker] poll query failed')
+        logger.error(
+          { err: error.message, code: error.code, details: error.details },
+          '[wa-worker] poll query failed'
+        )
       } else if (rows?.length) {
         logger.info({ count: rows.length }, '[wa-worker] fetched pending rows')
         for (const row of rows) {
