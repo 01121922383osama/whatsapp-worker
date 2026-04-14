@@ -151,6 +151,30 @@ async function destroyTenantSocket (tenantId) {
   tenantSockets.delete(tenantId)
 }
 
+/** WA socket died mid-send — drop cached socket so next dequeue opens a fresh connection */
+function shouldResetSocketAfterSendError (e) {
+  if (!e) return false
+  const msg = (e instanceof Error ? e.message : String(e)).toLowerCase()
+  const outCode =
+    typeof e?.output?.statusCode === 'number' ? e.output.statusCode : null
+  if (outCode === 428) return true
+  if (msg.includes('connection closed')) return true
+  if (msg.includes('precondition required')) return true
+  if (msg.includes('connection failure')) return true
+  if (msg.includes('socket hang up')) return true
+  if (msg.includes('econnreset')) return true
+  if (msg.includes('etimedout') || msg.includes(' timeout')) return true
+  if (msg.includes('stream errored')) return true
+  if (msg.includes('restart required')) return true
+  if (msg.includes('logged out')) return true
+  return false
+}
+
+async function resetTenantSendSocket (tenantId, reason) {
+  logger.warn({ tenantId, reason }, '[wa-worker] resetting send socket after error')
+  await destroyTenantSocket(tenantId)
+}
+
 async function processLogout (tenantId) {
   logger.info({ tenantId }, '[wa-worker] processing logout')
   const ent = tenantSockets.get(tenantId)
@@ -661,8 +685,13 @@ async function pollLoop () {
             logger.info({ queueId: row.id }, '[wa-worker] DB updated: sent')
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
+            const connDead = shouldResetSocketAfterSendError(e)
+            if (connDead) {
+              await resetTenantSendSocket(row.tenant_id, msg)
+            }
             const rc = (row.retry_count ?? 0) + 1
-            const failed = rc >= 5
+            /** Transient WA disconnects — allow more retries than hard failures */
+            const failed = connDead ? rc >= 12 : rc >= 5
             logger.error(
               {
                 queueId: row.id,
