@@ -167,6 +167,12 @@ function shouldResetSocketAfterSendError (e) {
   if (msg.includes('stream errored')) return true
   if (msg.includes('restart required')) return true
   if (msg.includes('logged out')) return true
+  if (msg.includes('bad mac')) return true
+  if (msg.includes('failed to decrypt')) return true
+  if (msg.includes('decrypt')) return true
+  if (msg.includes('sessionerror')) return true
+  if (msg.includes('no matching sessions')) return true
+  if (msg.includes('verifymac')) return true
   return false
 }
 
