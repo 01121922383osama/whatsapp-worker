@@ -372,6 +372,7 @@ async function startSocket (tenantId, ctx) {
       const err = lastDisconnect?.error
       const code = err?.output?.statusCode
       const msg = err?.message ?? String(err ?? '')
+      const msgLower = msg.toLowerCase()
       const reasonLabel = disconnectReasonLabel(code)
       const boomData = err?.data
       logger.warn(
@@ -419,6 +420,29 @@ async function startSocket (tenantId, ctx) {
         logger.info(
           { tenantId, code, reasonLabel, msg: msg.slice(0, 200) },
           '[wa-worker] pairing socket closed (no auto-reconnect for this close code)'
+        )
+        return
+      }
+
+      const badSession =
+        code === 500 ||
+        reasonLabel === 'badSession' ||
+        msgLower.includes('badsession') ||
+        msgLower.includes('init queries')
+      if (badSession) {
+        pairingHandled.delete(tenantId)
+        void rm(tenantAuthDir(tenantId), { recursive: true, force: true }).catch(() => {})
+        void updateSession(tenantId, {
+          status: 'error',
+          linked_wa_jid: null,
+          pairing_qr: null,
+          pairing_requested_at: null,
+          last_error: 'bad_session_repair_required',
+          worker_checked_at: new Date().toISOString()
+        })
+        logger.error(
+          { tenantId, code, reasonLabel, msg: msg.slice(0, 300) },
+          '[wa-worker] bad session detected — auth cleared, re-pair required'
         )
         return
       }
