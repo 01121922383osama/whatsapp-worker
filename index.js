@@ -62,7 +62,10 @@ const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL ||
 const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim()
 const pollMs = Number(process.env.WORKER_POLL_MS) || 8000
 const sessionPollMs = Number(process.env.WORKER_SESSION_POLL_MS) || 2500
-const authRoot = resolve(__dirname, 'auth_info_baileys')
+const authRootRaw = (process.env.WA_AUTH_ROOT || '').trim()
+const authRoot = authRootRaw
+  ? resolve(authRootRaw)
+  : resolve(__dirname, 'auth_info_baileys')
 
 if (!url || !key) {
   console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
@@ -75,7 +78,8 @@ logger.info(
     sessionPollMs,
     logLevel,
     supabaseHost: supabaseHostHint(),
-    authRoot
+    authRoot,
+    authRootFromEnv: Boolean(authRootRaw)
   },
   '[wa-worker] starting'
 )
@@ -403,12 +407,11 @@ async function startSocket (tenantId, ctx) {
         return
       }
 
-      void updateSession(tenantId, {
-        last_error: msg.slice(0, 500),
-        worker_checked_at: new Date().toISOString()
-      })
-
       if (ctx.mode === 'pairing') {
+        void updateSession(tenantId, {
+          last_error: msg.slice(0, 500),
+          worker_checked_at: new Date().toISOString()
+        })
         if (code === DisconnectReason.restartRequired) {
           scheduleReconnectPairing(tenantId, 500, { code, reasonLabel })
           return
@@ -419,6 +422,12 @@ async function startSocket (tenantId, ctx) {
         )
         return
       }
+
+      void updateSession(tenantId, {
+        status: 'disconnected',
+        last_error: msg.slice(0, 500),
+        worker_checked_at: new Date().toISOString()
+      })
 
       const delayMs =
         code === DisconnectReason.restartRequired ? 500 : 3000
@@ -692,6 +701,13 @@ async function pollLoop () {
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
             const connDead = shouldResetSocketAfterSendError(e)
+            if (msg.includes('whatsapp_not_linked')) {
+              await updateSession(row.tenant_id, {
+                status: 'disconnected',
+                last_error: msg.slice(0, 500),
+                worker_checked_at: new Date().toISOString()
+              })
+            }
             if (connDead) {
               await resetTenantSendSocket(row.tenant_id, msg)
             }
