@@ -659,6 +659,112 @@ async function resolveRecipientJid (sock, recipientRaw) {
   return { jid, resolution: 'phone_digits', meta: { digits } }
 }
 
+const LATE_START_MESSAGE_TYPES = new Set(['class_reminder_late', 'class_reminder_teacher_late'])
+/**
+ * Late-start queue rows store a frozen body; re-check the live session:
+ * - still `scheduled`, not started (`started_at` empty)
+ * - same cron band as enqueue: 10–15 minutes after scheduled_at (nothing older)
+ */
+const LATE_REMINDER_MIN_MINUTES = 10
+const LATE_REMINDER_MAX_MINUTES = 15
+
+/**
+ * Drop backlog rows: queue body was rendered at enqueue time and can show thousands of minutes
+ * if the worker was down. Use live session row instead.
+ * @returns {Promise<boolean>} true if row was abandoned (caller must not send)
+ */
+async function abandonStaleLateReminderIfNeeded (row) {
+  const messageType = row.message_type ?? ''
+  if (!LATE_START_MESSAGE_TYPES.has(messageType)) return false
+  const sessionId = row.session_id
+  if (!sessionId) {
+    logger.warn(
+      { queueId: row.id, messageType },
+      '[wa-worker] late reminder has no session_id — cannot validate freshness, skipping send'
+    )
+    const err = 'late_reminder_missing_session_id'
+    await supabase
+      .from('whatsapp_queue')
+      .update({
+        status: 'failed',
+        error: err,
+        retry_count: (row.retry_count ?? 0) + 1
+      })
+      .eq('id', row.id)
+    await supabase
+      .from('whatsapp_messages_log')
+      .update({ status: 'failed', error: err })
+      .eq('queue_id', row.id)
+    return true
+  }
+
+  const { data: sessionRow, error: sessErr } = await supabase
+    .from('sessions')
+    .select('scheduled_at, status, started_at')
+    .eq('id', sessionId)
+    .maybeSingle()
+
+  if (sessErr || !sessionRow?.scheduled_at) {
+    const err = sessErr
+      ? `late_reminder_session_lookup_failed:${sessErr.message}`
+      : 'late_reminder_session_not_found'
+    logger.warn(
+      { queueId: row.id, messageType, sessionId, err },
+      '[wa-worker] late reminder session lookup failed — skipping send'
+    )
+    await supabase
+      .from('whatsapp_queue')
+      .update({
+        status: 'failed',
+        error: err.slice(0, 500),
+        retry_count: (row.retry_count ?? 0) + 1
+      })
+      .eq('id', row.id)
+    await supabase
+      .from('whatsapp_messages_log')
+      .update({ status: 'failed', error: err.slice(0, 500) })
+      .eq('queue_id', row.id)
+    return true
+  }
+
+  const st = String(sessionRow.status ?? '').toLowerCase()
+  const started = Boolean(sessionRow.started_at)
+  const scheduledMs = new Date(sessionRow.scheduled_at).getTime()
+  const minutesSince = Math.round((Date.now() - scheduledMs) / 60000)
+  const inLateWindow =
+    st === 'scheduled' &&
+    !started &&
+    minutesSince >= LATE_REMINDER_MIN_MINUTES &&
+    minutesSince <= LATE_REMINDER_MAX_MINUTES
+
+  if (inLateWindow) return false
+
+  const err = `stale_late_reminder:status=${st};minutesSince=${minutesSince}`
+  logger.info(
+    {
+      queueId: row.id,
+      messageType,
+      sessionId,
+      status: st,
+      minutesSince
+    },
+    '[wa-worker] abandoning stale late reminder (session started, too old, or not in late window)'
+  )
+  await supabase
+    .from('whatsapp_queue')
+    .update({
+      status: 'failed',
+      error: err.slice(0, 500),
+      retry_count: (row.retry_count ?? 0) + 1
+    })
+    .eq('id', row.id)
+  await supabase
+    .from('whatsapp_messages_log')
+    .update({ status: 'failed', error: err.slice(0, 500) })
+    .eq('queue_id', row.id)
+  return true
+}
+
 async function sendOnce (row) {
   const tenantId = row.tenant_id
   const s = await getSockForSend(tenantId)
@@ -693,7 +799,7 @@ async function pollLoop () {
       const { data: rows, error } = await supabase
         .from('whatsapp_queue')
         .select(
-          'id, tenant_id, recipient_phone, message_type, recipient_type, message_body, status, retry_count'
+          'id, tenant_id, recipient_phone, message_type, recipient_type, message_body, status, retry_count, session_id'
         )
         .or('status.is.null,status.eq.pending')
         .lte('scheduled_at', new Date().toISOString())
@@ -708,6 +814,11 @@ async function pollLoop () {
         logger.info({ count: rows.length }, '[wa-worker] fetched pending rows')
         for (const row of rows) {
           try {
+            const abandoned = await abandonStaleLateReminderIfNeeded(row)
+            if (abandoned) {
+              logger.info({ queueId: row.id }, '[wa-worker] stale late reminder abandoned, not sent')
+              continue
+            }
             await sendOnce(row)
             await supabase
               .from('whatsapp_queue')
