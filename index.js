@@ -725,10 +725,33 @@ async function pollLoop () {
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
             const connDead = shouldResetSocketAfterSendError(e)
+            const msgLower = msg.toLowerCase()
+            const badSessionSendError =
+              msgLower.includes('badsession') ||
+              msgLower.includes('bad session') ||
+              msgLower.includes('bad mac') ||
+              msgLower.includes('failed to decrypt') ||
+              msgLower.includes('no matching sessions') ||
+              msgLower.includes('sessionerror') ||
+              msgLower.includes('verifymac')
             if (msg.includes('whatsapp_not_linked')) {
               await updateSession(row.tenant_id, {
                 status: 'disconnected',
                 last_error: msg.slice(0, 500),
+                worker_checked_at: new Date().toISOString()
+              })
+            }
+            if (badSessionSendError) {
+              pairingHandled.delete(row.tenant_id)
+              await rm(tenantAuthDir(row.tenant_id), { recursive: true, force: true }).catch(
+                () => {}
+              )
+              await updateSession(row.tenant_id, {
+                status: 'error',
+                linked_wa_jid: null,
+                pairing_qr: null,
+                pairing_requested_at: null,
+                last_error: 'bad_session_repair_required',
                 worker_checked_at: new Date().toISOString()
               })
             }
