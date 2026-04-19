@@ -102,6 +102,44 @@ function hasPersistedCreds (tenantId) {
 /** @type {Map<string, { sock: any }>} */
 const tenantSockets = new Map()
 
+/**
+ * Cache participating-groups list per tenant for a short window.
+ * Re-fetching it for every queued row triggered WhatsApp Web rate limits and
+ * showed up as "stream errored out (ack)" / repeated reconnects in the logs.
+ * @type {Map<string, { at: number, groups: { id: string, subject: string }[] }>}
+ */
+const tenantGroupsCache = new Map()
+const GROUPS_CACHE_TTL_MS = 60_000
+
+async function getCachedGroups (tenantId, sock) {
+  const now = Date.now()
+  const cached = tenantGroupsCache.get(tenantId)
+  if (cached && now - cached.at < GROUPS_CACHE_TTL_MS) {
+    return cached.groups
+  }
+  const map = await sock.groupFetchAllParticipating()
+  const groups = Object.values(map).map((g) => ({
+    id: String(g?.id ?? ''),
+    subject: String(g?.subject ?? '').trim()
+  }))
+  tenantGroupsCache.set(tenantId, { at: now, groups })
+  return groups
+}
+
+function invalidateGroupsCache (tenantId) {
+  tenantGroupsCache.delete(tenantId)
+}
+
+/** Errors that will never resolve by retrying the same row — fail immediately. */
+function isPermanentSendError (msg) {
+  if (!msg) return false
+  const m = String(msg).toLowerCase()
+  if (m.startsWith('group_not_found')) return true
+  if (m === 'empty_phone' || m === 'invalid_phone' || m === 'empty_group_name') return true
+  if (m.includes('bad_session_repair_required')) return true
+  return false
+}
+
 function previewBody (text, max = 160) {
   const s = String(text ?? '')
   if (logBodies) return s
@@ -317,7 +355,7 @@ async function startSocket (tenantId, ctx) {
   const { state, saveCreds } = await useMultiFileAuthState(authDir)
   const sock = makeWASocket({
     logger: pino({
-      level: logDebug ? 'debug' : 'warn'
+      level: logDebug ? 'debug' : 'error'
     }),
     version,
     auth: state
@@ -578,11 +616,21 @@ async function pollSessions () {
   }
 }
 
+/** @type {Map<string, number>} */
+const notLinkedLastLogged = new Map()
+const NOT_LINKED_LOG_INTERVAL_MS = 5 * 60 * 1000
+
 async function getSockForSend (tenantId) {
   if (!hasPersistedCreds(tenantId)) {
-    logger.warn({ tenantId }, '[wa-worker] getSockForSend — whatsapp_not_linked (no creds.json)')
+    const now = Date.now()
+    const last = notLinkedLastLogged.get(tenantId) ?? 0
+    if (now - last > NOT_LINKED_LOG_INTERVAL_MS) {
+      notLinkedLastLogged.set(tenantId, now)
+      logger.warn({ tenantId }, '[wa-worker] whatsapp_not_linked (no creds.json) — pair from admin settings')
+    }
     throw new Error('whatsapp_not_linked')
   }
+  notLinkedLastLogged.delete(tenantId)
   let ent = tenantSockets.get(tenantId)
   if (ent?.sock?.user) {
     return ent.sock
@@ -611,7 +659,7 @@ async function getSockForSend (tenantId) {
   throw new Error('whatsapp_not_ready')
 }
 
-async function resolveRecipientJid (sock, recipientRaw) {
+async function resolveRecipientJid (tenantId, sock, recipientRaw) {
   const wa = String(recipientRaw ?? '').trim()
   if (!wa) {
     throw new Error('empty_phone')
@@ -626,24 +674,17 @@ async function resolveRecipientJid (sock, recipientRaw) {
     if (!wanted) {
       throw new Error('empty_group_name')
     }
-    logger.info({ wanted }, '[wa-worker] resolving group by subject (exact match, case-insensitive)')
-    const groups = await sock.groupFetchAllParticipating()
-    const list = Object.values(groups)
-    const hit = list.find((g) => {
-      const subject = String(g?.subject ?? '').trim().toLowerCase()
-      return subject === wanted
-    })
+    if (logDebug) {
+      logger.debug({ tenantId, wanted }, '[wa-worker] resolving group by subject (cached)')
+    }
+    const groups = await getCachedGroups(tenantId, sock)
+    const hit = groups.find((g) => g.subject.toLowerCase() === wanted)
     if (!hit?.id) {
-      const sample = list
-        .slice(0, 15)
-        .map((g) => ({ id: g?.id, subject: g?.subject }))
-      logger.warn(
-        { wanted, participatingGroupCount: list.length, sampleSubjects: sample },
-        '[wa-worker] group_not_found — check spelling vs WhatsApp group title'
-      )
       throw new Error(`group_not_found:${wanted}`)
     }
-    logger.info({ jid: hit.id, subject: hit.subject, wanted }, '[wa-worker] group resolved')
+    if (logDebug) {
+      logger.debug({ tenantId, jid: hit.id, subject: hit.subject }, '[wa-worker] group resolved')
+    }
     return {
       jid: hit.id,
       resolution: 'group_by_name',
@@ -740,16 +781,18 @@ async function abandonStaleLateReminderIfNeeded (row) {
   if (inLateWindow) return false
 
   const err = `stale_late_reminder:status=${st};minutesSince=${minutesSince}`
-  logger.info(
-    {
-      queueId: row.id,
-      messageType,
-      sessionId,
-      status: st,
-      minutesSince
-    },
-    '[wa-worker] abandoning stale late reminder (session started, too old, or not in late window)'
-  )
+  if (logDebug) {
+    logger.debug(
+      {
+        queueId: row.id,
+        messageType,
+        sessionId,
+        status: st,
+        minutesSince
+      },
+      '[wa-worker] abandoning stale late reminder'
+    )
+  }
   await supabase
     .from('whatsapp_queue')
     .update({
@@ -784,9 +827,11 @@ async function sendOnce (row) {
     '[wa-worker] dequeue — about to send'
   )
 
-  const { jid, resolution, meta } = await resolveRecipientJid(s, row.recipient_phone)
+  const { jid, resolution, meta } = await resolveRecipientJid(tenantId, s, row.recipient_phone)
 
-  logger.info({ queueId, jid, resolution, ...meta }, '[wa-worker] resolved JID')
+  if (logDebug) {
+    logger.debug({ queueId, jid, resolution, ...meta }, '[wa-worker] resolved JID')
+  }
 
   await s.sendMessage(jid, { text: String(row.message_body ?? '') })
 
@@ -811,12 +856,24 @@ async function pollLoop () {
           '[wa-worker] poll query failed'
         )
       } else if (rows?.length) {
-        logger.info({ count: rows.length }, '[wa-worker] fetched pending rows')
+        if (logDebug) {
+          logger.debug({ count: rows.length }, '[wa-worker] fetched pending rows')
+        }
         for (const row of rows) {
           try {
             const abandoned = await abandonStaleLateReminderIfNeeded(row)
-            if (abandoned) {
-              logger.info({ queueId: row.id }, '[wa-worker] stale late reminder abandoned, not sent')
+            if (abandoned) continue
+            /** Skip rows whose tenant is not linked (without burning a retry slot). */
+            if (!hasPersistedCreds(row.tenant_id)) {
+              const now = Date.now()
+              const last = notLinkedLastLogged.get(row.tenant_id) ?? 0
+              if (now - last > NOT_LINKED_LOG_INTERVAL_MS) {
+                notLinkedLastLogged.set(row.tenant_id, now)
+                logger.warn(
+                  { tenantId: row.tenant_id },
+                  '[wa-worker] skipping queued rows — tenant not linked (pair from admin settings)'
+                )
+              }
               continue
             }
             await sendOnce(row)
@@ -852,6 +909,9 @@ async function pollLoop () {
                 worker_checked_at: new Date().toISOString()
               })
             }
+            if (msgLower.startsWith('group_not_found')) {
+              invalidateGroupsCache(row.tenant_id)
+            }
             if (badSessionSendError) {
               pairingHandled.delete(row.tenant_id)
               await rm(tenantAuthDir(row.tenant_id), { recursive: true, force: true }).catch(
@@ -870,8 +930,9 @@ async function pollLoop () {
               await resetTenantSendSocket(row.tenant_id, msg)
             }
             const rc = (row.retry_count ?? 0) + 1
+            const permanent = isPermanentSendError(msg) || badSessionSendError
             /** Transient WA disconnects — allow more retries than hard failures */
-            const failed = connDead ? rc >= 12 : rc >= 5
+            const failed = permanent || (connDead ? rc >= 12 : rc >= 5)
             logger.error(
               {
                 queueId: row.id,
@@ -879,7 +940,8 @@ async function pollLoop () {
                 recipientRaw: row.recipient_phone,
                 err: msg,
                 retryCount: rc,
-                willFailPermanently: failed
+                willFailPermanently: failed,
+                permanent
               },
               '[wa-worker] send failed'
             )
