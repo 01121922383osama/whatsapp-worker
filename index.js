@@ -103,6 +103,46 @@ function hasPersistedCreds (tenantId) {
 const tenantSockets = new Map()
 
 /**
+ * Rolling-window counter for transient session-level failures (Bad MAC, decrypt,
+ * verifymac, init queries, code 500). Baileys usually self-heals these by
+ * reopening the socket, so we no longer wipe auth_info_baileys/<tenant> on the
+ * first error (which used to force a new QR). Auth is only wiped after too many
+ * errors in a short window, which likely means the session is genuinely dead.
+ * @type {Map<string, { count: number, firstAt: number, lastAt: number }>}
+ */
+const tenantSessionFailures = new Map()
+const BAD_SESSION_WINDOW_MS = 10 * 60 * 1000
+const BAD_SESSION_THRESHOLD = 7
+
+function recordSessionFailure (tenantId) {
+  const now = Date.now()
+  const prev = tenantSessionFailures.get(tenantId)
+  if (!prev || now - prev.firstAt > BAD_SESSION_WINDOW_MS) {
+    const fresh = { count: 1, firstAt: now, lastAt: now }
+    tenantSessionFailures.set(tenantId, fresh)
+    return fresh
+  }
+  prev.count += 1
+  prev.lastAt = now
+  tenantSessionFailures.set(tenantId, prev)
+  return prev
+}
+
+function resetSessionFailures (tenantId) {
+  tenantSessionFailures.delete(tenantId)
+}
+
+function shouldWipeAuth (tenantId) {
+  const entry = tenantSessionFailures.get(tenantId)
+  if (!entry) return false
+  if (Date.now() - entry.firstAt > BAD_SESSION_WINDOW_MS) {
+    tenantSessionFailures.delete(tenantId)
+    return false
+  }
+  return entry.count >= BAD_SESSION_THRESHOLD
+}
+
+/**
  * Cache participating-groups list per tenant for a short window.
  * Re-fetching it for every queued row triggered WhatsApp Web rate limits and
  * showed up as "stream errored out (ack)" / repeated reconnects in the logs.
@@ -223,6 +263,32 @@ async function resetTenantSendSocket (tenantId, reason) {
   await destroyTenantSocket(tenantId)
 }
 
+async function wipeTenantAuth (tenantId, reason) {
+  logger.error(
+    { tenantId, reason, failures: tenantSessionFailures.get(tenantId) },
+    '[wa-worker] wiping tenant auth — repair required'
+  )
+  pairingHandled.delete(tenantId)
+  resetSessionFailures(tenantId)
+  await destroyTenantSocket(tenantId)
+  try {
+    await rm(tenantAuthDir(tenantId), { recursive: true, force: true })
+  } catch (e) {
+    logger.warn(
+      { tenantId, err: e instanceof Error ? e.message : String(e) },
+      '[wa-worker] rm auth dir'
+    )
+  }
+  await updateSession(tenantId, {
+    status: 'error',
+    linked_wa_jid: null,
+    pairing_qr: null,
+    pairing_requested_at: null,
+    last_error: 'bad_session_repair_required',
+    worker_checked_at: new Date().toISOString()
+  })
+}
+
 async function processLogout (tenantId) {
   logger.info({ tenantId }, '[wa-worker] processing logout')
   const ent = tenantSockets.get(tenantId)
@@ -238,6 +304,7 @@ async function processLogout (tenantId) {
   }
   tenantSockets.delete(tenantId)
   pairingHandled.delete(tenantId)
+  resetSessionFailures(tenantId)
   try {
     await rm(tenantAuthDir(tenantId), { recursive: true, force: true })
   } catch (e) {
@@ -396,6 +463,7 @@ async function startSocket (tenantId, ctx) {
       const wid = sock.user?.id ?? null
       logger.info({ tenantId, loggedInJid: wid }, '[wa-worker] WhatsApp connected')
       pairingHandled.delete(tenantId)
+      resetSessionFailures(tenantId)
       void updateSession(tenantId, {
         status: 'connected',
         linked_wa_jid: wid,
@@ -434,6 +502,7 @@ async function startSocket (tenantId, ctx) {
 
       if (loggedOut) {
         pairingHandled.delete(tenantId)
+        resetSessionFailures(tenantId)
         void rm(tenantAuthDir(tenantId), { recursive: true, force: true }).catch(() => {})
         void updateSession(tenantId, {
           status: 'disconnected',
@@ -462,26 +531,49 @@ async function startSocket (tenantId, ctx) {
         return
       }
 
-      const badSession =
+      /**
+       * Transient signal/crypto errors look scary (code 500 / badSession / "init queries" /
+       * Bad MAC / decrypt) but Baileys usually heals them by reopening the socket with the
+       * same creds. Only wipe auth once we see many of these in a short window — otherwise
+       * we force the admin to re-scan QR after every brief hiccup (common cause: the same
+       * WhatsApp number signed into WhatsApp Web/Desktop elsewhere while the worker is running).
+       */
+      const sessionLevelError =
         code === 500 ||
         reasonLabel === 'badSession' ||
         msgLower.includes('badsession') ||
-        msgLower.includes('init queries')
-      if (badSession) {
-        pairingHandled.delete(tenantId)
-        void rm(tenantAuthDir(tenantId), { recursive: true, force: true }).catch(() => {})
+        msgLower.includes('init queries') ||
+        msgLower.includes('bad mac') ||
+        msgLower.includes('failed to decrypt') ||
+        msgLower.includes('decrypt') ||
+        msgLower.includes('no matching sessions') ||
+        msgLower.includes('sessionerror') ||
+        msgLower.includes('verifymac')
+
+      if (sessionLevelError) {
+        const tracker = recordSessionFailure(tenantId)
+        if (shouldWipeAuth(tenantId)) {
+          void wipeTenantAuth(tenantId, `close:${reasonLabel}:${msg.slice(0, 120)}`)
+          return
+        }
+        logger.warn(
+          {
+            tenantId,
+            code,
+            reasonLabel,
+            msg: msg.slice(0, 200),
+            failureCount: tracker.count,
+            threshold: BAD_SESSION_THRESHOLD,
+            windowMs: BAD_SESSION_WINDOW_MS
+          },
+          '[wa-worker] transient session error — keeping auth, reconnecting'
+        )
         void updateSession(tenantId, {
-          status: 'error',
-          linked_wa_jid: null,
-          pairing_qr: null,
-          pairing_requested_at: null,
-          last_error: 'bad_session_repair_required',
+          status: 'disconnected',
+          last_error: `transient:${msg.slice(0, 400)}`,
           worker_checked_at: new Date().toISOString()
         })
-        logger.error(
-          { tenantId, code, reasonLabel, msg: msg.slice(0, 300) },
-          '[wa-worker] bad session detected — auth cleared, re-pair required'
-        )
+        scheduleReconnectSend(tenantId, 2000, { code, reasonLabel })
         return
       }
 
@@ -877,6 +969,7 @@ async function pollLoop () {
               continue
             }
             await sendOnce(row)
+            resetSessionFailures(row.tenant_id)
             await supabase
               .from('whatsapp_queue')
               .update({
@@ -912,25 +1005,43 @@ async function pollLoop () {
             if (msgLower.startsWith('group_not_found')) {
               invalidateGroupsCache(row.tenant_id)
             }
+            /**
+             * Used to wipe auth immediately on the first decrypt/Bad MAC/verifymac — but
+             * these are usually transient (often caused by the same WA number being used
+             * on WhatsApp Web/Desktop elsewhere while the worker is running). Count them
+             * in the rolling window; only wipe after the threshold so the admin doesn't
+             * lose pairing on every hiccup.
+             */
+            let wiped = false
             if (badSessionSendError) {
-              pairingHandled.delete(row.tenant_id)
-              await rm(tenantAuthDir(row.tenant_id), { recursive: true, force: true }).catch(
-                () => {}
-              )
-              await updateSession(row.tenant_id, {
-                status: 'error',
-                linked_wa_jid: null,
-                pairing_qr: null,
-                pairing_requested_at: null,
-                last_error: 'bad_session_repair_required',
-                worker_checked_at: new Date().toISOString()
-              })
+              const tracker = recordSessionFailure(row.tenant_id)
+              if (shouldWipeAuth(row.tenant_id)) {
+                await wipeTenantAuth(row.tenant_id, `send:${msg.slice(0, 120)}`)
+                wiped = true
+              } else {
+                logger.warn(
+                  {
+                    tenantId: row.tenant_id,
+                    queueId: row.id,
+                    err: msg.slice(0, 200),
+                    failureCount: tracker.count,
+                    threshold: BAD_SESSION_THRESHOLD
+                  },
+                  '[wa-worker] transient send-side session error — keeping auth, will retry'
+                )
+              }
             }
             if (connDead) {
               await resetTenantSendSocket(row.tenant_id, msg)
             }
             const rc = (row.retry_count ?? 0) + 1
-            const permanent = isPermanentSendError(msg) || badSessionSendError
+            /**
+             * `badSessionSendError` used to force a permanent failure on the queue row.
+             * Now those are treated as transient (the message will go out once the socket
+             * reopens), so we only permanently fail if isPermanentSendError says so OR we
+             * actually wiped auth, OR retries are exhausted.
+             */
+            const permanent = isPermanentSendError(msg) || wiped
             /** Transient WA disconnects — allow more retries than hard failures */
             const failed = permanent || (connDead ? rc >= 12 : rc >= 5)
             logger.error(
@@ -941,7 +1052,8 @@ async function pollLoop () {
                 err: msg,
                 retryCount: rc,
                 willFailPermanently: failed,
-                permanent
+                permanent,
+                wiped
               },
               '[wa-worker] send failed'
             )
