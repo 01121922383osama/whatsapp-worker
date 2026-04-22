@@ -940,6 +940,8 @@ async function pollLoop () {
         )
         .or('status.is.null,status.eq.pending')
         .lte('scheduled_at', new Date().toISOString())
+        .order('scheduled_at', { ascending: true })
+        .order('id', { ascending: true })
         .limit(5)
 
       if (error) {
@@ -957,6 +959,25 @@ async function pollLoop () {
             if (abandoned) continue
             /** Skip rows whose tenant is not linked (without burning a retry slot). */
             if (!hasPersistedCreds(row.tenant_id)) {
+              /** Explain in DB/UI why pending rows never leave — without failing the row (sends after pairing). */
+              const notLinkedErr = 'whatsapp_not_linked'
+              const deferMs = 60_000 + (String(row.id).charCodeAt(0) % 45) * 1000
+              const deferredUntil = new Date(Date.now() + deferMs).toISOString()
+              /** Always bump schedule so one dead tenant cannot starve others in the same DB (FIFO poll). */
+              await supabase
+                .from('whatsapp_queue')
+                .update({ scheduled_at: deferredUntil })
+                .eq('id', row.id)
+              await supabase
+                .from('whatsapp_queue')
+                .update({ error: notLinkedErr })
+                .eq('id', row.id)
+                .is('error', null)
+              await supabase
+                .from('whatsapp_messages_log')
+                .update({ error: notLinkedErr })
+                .eq('queue_id', row.id)
+                .is('error', null)
               const now = Date.now()
               const last = notLinkedLastLogged.get(row.tenant_id) ?? 0
               if (now - last > NOT_LINKED_LOG_INTERVAL_MS) {
