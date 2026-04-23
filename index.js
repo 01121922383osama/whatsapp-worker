@@ -410,9 +410,24 @@ function scheduleReconnectPairing (tenantId, delayMs, closeMeta) {
 async function startSocket (tenantId, ctx) {
   await destroyTenantSocket(tenantId)
 
-  const { version, isLatest } = await fetchLatestBaileysVersion()
-  if (!isLatest) {
-    logger.warn({ version, tenantId }, '[wa-worker] Using fetched WA version (not marked latest)')
+  let version = null
+  try {
+    const latest = await fetchLatestBaileysVersion()
+    version = latest.version
+    if (!latest.isLatest) {
+      logger.warn(
+        { version, tenantId },
+        '[wa-worker] Using fetched WA version (not marked latest)'
+      )
+    }
+  } catch (e) {
+    logger.warn(
+      {
+        tenantId,
+        err: e instanceof Error ? e.message : String(e)
+      },
+      '[wa-worker] fetchLatestBaileysVersion failed; continuing with default bundled version'
+    )
   }
 
   const authDir = tenantAuthDir(tenantId)
@@ -420,13 +435,16 @@ async function startSocket (tenantId, ctx) {
     logger.debug({ tenantId, authDir, mode: ctx.mode }, '[wa-worker] useMultiFileAuthState')
   }
   const { state, saveCreds } = await useMultiFileAuthState(authDir)
-  const sock = makeWASocket({
+  const sockOptions = {
     logger: pino({
       level: logDebug ? 'debug' : 'error'
     }),
-    version,
     auth: state
-  })
+  }
+  if (Array.isArray(version)) {
+    sockOptions.version = version
+  }
+  const sock = makeWASocket(sockOptions)
 
   tenantSockets.set(tenantId, { sock })
 
@@ -863,7 +881,8 @@ async function abandonStaleLateReminderIfNeeded (row) {
   const st = String(sessionRow.status ?? '').toLowerCase()
   const started = Boolean(sessionRow.started_at)
   const scheduledMs = new Date(sessionRow.scheduled_at).getTime()
-  const minutesSince = Math.round((Date.now() - scheduledMs) / 60000)
+  // Keep the same floor-based minute math as enqueue to avoid off-by-one skips.
+  const minutesSince = Math.floor((Date.now() - scheduledMs) / 60000)
   const inLateWindow =
     st === 'scheduled' &&
     !started &&
