@@ -855,6 +855,8 @@ function parseAssignmentMediaBody (row) {
   const kind = parsed?.kind === 'image' ? 'image' : parsed?.kind === 'pdf' ? 'pdf' : ''
   const mimeType = String(parsed?.mimeType ?? '').trim() ||
     (kind === 'pdf' ? 'application/pdf' : 'image/jpeg')
+  const tenantId = String(parsed?.tenantId ?? '').trim()
+  const assignmentId = String(parsed?.assignmentId ?? '').trim()
 
   if (bucket !== 'assignments' || !path || !kind) {
     throw new Error('invalid_media_payload')
@@ -862,8 +864,11 @@ function parseAssignmentMediaBody (row) {
   if (!path.startsWith(`${row.tenant_id}/`)) {
     throw new Error('media_path_tenant_mismatch')
   }
+  if (tenantId && tenantId !== row.tenant_id) {
+    throw new Error('media_tenant_mismatch')
+  }
 
-  return { bucket, path, fileName, kind, mimeType }
+  return { bucket, path, fileName, kind, mimeType, assignmentId }
 }
 
 async function downloadStorageMedia (media) {
@@ -883,8 +888,7 @@ async function sendAssignmentMedia (sock, jid, row) {
   if (media.kind === 'image') {
     await sock.sendMessage(jid, {
       image: buffer,
-      mimetype: media.mimeType,
-      caption: media.fileName
+      mimetype: media.mimeType
     })
     return
   }
@@ -892,8 +896,71 @@ async function sendAssignmentMedia (sock, jid, row) {
   await sock.sendMessage(jid, {
     document: buffer,
     mimetype: media.mimeType || 'application/pdf',
-    fileName: media.fileName
+    fileName: 'assignment.pdf'
   })
+}
+
+async function deleteAssignmentAttachmentAfterSend (row, media) {
+  const { error: rmErr } = await supabase.storage.from(media.bucket).remove([media.path])
+  if (rmErr) {
+    logger.warn(
+      { queueId: row.id, tenantId: row.tenant_id, path: media.path, err: rmErr.message },
+      '[wa-worker] storage remove failed (continuing)'
+    )
+  }
+
+  if (!media.assignmentId) return
+
+  const { data: assignment, error: aErr } = await supabase
+    .from('assignments')
+    .select('id, tenant_id, content, file_url')
+    .eq('id', media.assignmentId)
+    .eq('tenant_id', row.tenant_id)
+    .maybeSingle()
+
+  if (aErr || !assignment) {
+    logger.warn(
+      { queueId: row.id, assignmentId: media.assignmentId, err: aErr?.message },
+      '[wa-worker] assignment fetch failed for attachment cleanup'
+    )
+    return
+  }
+
+  const content = assignment.content && typeof assignment.content === 'object' && !Array.isArray(assignment.content)
+    ? { ...assignment.content }
+    : {}
+
+  const rawAttachments = content.attachments
+  if (Array.isArray(rawAttachments)) {
+    const nextAttachments = rawAttachments.filter((item) => {
+      if (!item || typeof item !== 'object') return true
+      const p = String((item).path ?? '').trim()
+      return p !== media.path
+    })
+    if (nextAttachments.length > 0) {
+      content.attachments = nextAttachments
+    } else {
+      delete content.attachments
+    }
+  }
+
+  const nextFileUrl = assignment.file_url === media.path ? null : assignment.file_url
+
+  const { error: uErr } = await supabase
+    .from('assignments')
+    .update({
+      content,
+      file_url: nextFileUrl
+    })
+    .eq('id', media.assignmentId)
+    .eq('tenant_id', row.tenant_id)
+
+  if (uErr) {
+    logger.warn(
+      { queueId: row.id, assignmentId: media.assignmentId, err: uErr.message },
+      '[wa-worker] assignment content update failed after send'
+    )
+  }
 }
 
 /**
@@ -965,6 +1032,15 @@ async function sendOnce (row) {
       )
     }
     await sendAssignmentMedia(s, jid, row)
+    try {
+      const media = parseAssignmentMediaBody(row)
+      await deleteAssignmentAttachmentAfterSend(row, media)
+    } catch (e) {
+      logger.warn(
+        { queueId, err: e instanceof Error ? e.message : String(e) },
+        '[wa-worker] post-send cleanup skipped'
+      )
+    }
   } else {
     await s.sendMessage(jid, { text: bodyText })
   }
