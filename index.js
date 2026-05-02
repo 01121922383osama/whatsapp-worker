@@ -811,110 +811,115 @@ async function resolveRecipientJid (tenantId, sock, recipientRaw) {
 }
 
 const LATE_START_MESSAGE_TYPES = new Set(['class_reminder_late', 'class_reminder_teacher_late'])
-/**
- * Late-start queue rows store a frozen body; re-check the live session:
- * - still `scheduled`, not started (`started_at` empty)
- * - same cron band as enqueue: 10–15 minutes after scheduled_at (nothing older)
- */
-const LATE_REMINDER_MIN_MINUTES = 10
-const LATE_REMINDER_MAX_MINUTES = 15
+const ASSIGNMENT_MEDIA_MESSAGE_TYPE = 'assignment_created_parent_media'
+
+function looksLikeAssignmentMediaPayload (rawBody) {
+  const s = String(rawBody ?? '').trim()
+  if (!s.startsWith('{') || !s.endsWith('}')) return false
+  try {
+    const parsed = JSON.parse(s)
+    const bucket = String(parsed?.bucket ?? '').trim()
+    const path = String(parsed?.path ?? '').trim()
+    const kind = parsed?.kind === 'image' ? 'image' : parsed?.kind === 'pdf' ? 'pdf' : ''
+    return bucket === 'assignments' && Boolean(path) && Boolean(kind)
+  } catch {
+    return false
+  }
+}
+
+function parseMediaPayloadFromRecipientType (recipientType) {
+  const raw = String(recipientType ?? '').trim()
+  if (!raw.startsWith('media:')) return null
+  try {
+    const json = Buffer.from(raw.slice('media:'.length), 'base64url').toString('utf8')
+    return JSON.parse(json)
+  } catch {
+    throw new Error('invalid_media_payload')
+  }
+}
+
+function parseAssignmentMediaBody (row) {
+  const parsedFromRecipientType = parseMediaPayloadFromRecipientType(row.recipient_type)
+  let parsed = parsedFromRecipientType
+  if (!parsed) {
+    try {
+      parsed = JSON.parse(String(row.message_body ?? '{}'))
+    } catch {
+      throw new Error('invalid_media_payload')
+    }
+  }
+
+  const bucket = String(parsed?.bucket ?? '').trim()
+  const path = String(parsed?.path ?? '').trim()
+  const fileName = String(parsed?.fileName ?? '').trim() || 'assignment-file'
+  const kind = parsed?.kind === 'image' ? 'image' : parsed?.kind === 'pdf' ? 'pdf' : ''
+  const mimeType = String(parsed?.mimeType ?? '').trim() ||
+    (kind === 'pdf' ? 'application/pdf' : 'image/jpeg')
+
+  if (bucket !== 'assignments' || !path || !kind) {
+    throw new Error('invalid_media_payload')
+  }
+  if (!path.startsWith(`${row.tenant_id}/`)) {
+    throw new Error('media_path_tenant_mismatch')
+  }
+
+  return { bucket, path, fileName, kind, mimeType }
+}
+
+async function downloadStorageMedia (media) {
+  const { data, error } = await supabase.storage
+    .from(media.bucket)
+    .download(media.path)
+  if (error || !data) {
+    throw new Error(`media_download_failed:${error?.message ?? 'empty'}`)
+  }
+  return Buffer.from(await data.arrayBuffer())
+}
+
+async function sendAssignmentMedia (sock, jid, row) {
+  const media = parseAssignmentMediaBody(row)
+  const buffer = await downloadStorageMedia(media)
+
+  if (media.kind === 'image') {
+    await sock.sendMessage(jid, {
+      image: buffer,
+      mimetype: media.mimeType,
+      caption: media.fileName
+    })
+    return
+  }
+
+  await sock.sendMessage(jid, {
+    document: buffer,
+    mimetype: media.mimeType || 'application/pdf',
+    fileName: media.fileName
+  })
+}
 
 /**
- * Drop backlog rows: queue body was rendered at enqueue time and can show thousands of minutes
- * if the worker was down. Use live session row instead.
+ * Late-start messages are disabled; abandon any queued backlog so only normal
+ * class reminders are sent.
  * @returns {Promise<boolean>} true if row was abandoned (caller must not send)
  */
 async function abandonStaleLateReminderIfNeeded (row) {
   const messageType = row.message_type ?? ''
   if (!LATE_START_MESSAGE_TYPES.has(messageType)) return false
-  const sessionId = row.session_id
-  if (!sessionId) {
-    logger.warn(
-      { queueId: row.id, messageType },
-      '[wa-worker] late reminder has no session_id — cannot validate freshness, skipping send'
-    )
-    const err = 'late_reminder_missing_session_id'
-    await supabase
-      .from('whatsapp_queue')
-      .update({
-        status: 'failed',
-        error: err,
-        retry_count: (row.retry_count ?? 0) + 1
-      })
-      .eq('id', row.id)
-    await supabase
-      .from('whatsapp_messages_log')
-      .update({ status: 'failed', error: err })
-      .eq('queue_id', row.id)
-    return true
-  }
-
-  const { data: sessionRow, error: sessErr } = await supabase
-    .from('sessions')
-    .select('scheduled_at, status, started_at')
-    .eq('id', sessionId)
-    .maybeSingle()
-
-  if (sessErr || !sessionRow?.scheduled_at) {
-    const err = sessErr
-      ? `late_reminder_session_lookup_failed:${sessErr.message}`
-      : 'late_reminder_session_not_found'
-    logger.warn(
-      { queueId: row.id, messageType, sessionId, err },
-      '[wa-worker] late reminder session lookup failed — skipping send'
-    )
-    await supabase
-      .from('whatsapp_queue')
-      .update({
-        status: 'failed',
-        error: err.slice(0, 500),
-        retry_count: (row.retry_count ?? 0) + 1
-      })
-      .eq('id', row.id)
-    await supabase
-      .from('whatsapp_messages_log')
-      .update({ status: 'failed', error: err.slice(0, 500) })
-      .eq('queue_id', row.id)
-    return true
-  }
-
-  const st = String(sessionRow.status ?? '').toLowerCase()
-  const started = Boolean(sessionRow.started_at)
-  const scheduledMs = new Date(sessionRow.scheduled_at).getTime()
-  // Keep the same floor-based minute math as enqueue to avoid off-by-one skips.
-  const minutesSince = Math.floor((Date.now() - scheduledMs) / 60000)
-  const inLateWindow =
-    st === 'scheduled' &&
-    !started &&
-    minutesSince >= LATE_REMINDER_MIN_MINUTES &&
-    minutesSince <= LATE_REMINDER_MAX_MINUTES
-
-  if (inLateWindow) return false
-
-  const err = `stale_late_reminder:status=${st};minutesSince=${minutesSince}`
-  if (logDebug) {
-    logger.debug(
-      {
-        queueId: row.id,
-        messageType,
-        sessionId,
-        status: st,
-        minutesSince
-      },
-      '[wa-worker] abandoning stale late reminder'
-    )
-  }
+  const err = 'late_start_reminders_disabled'
+  logger.info(
+    { queueId: row.id, messageType, sessionId: row.session_id },
+    '[wa-worker] abandoning disabled late-start reminder'
+  )
   await supabase
     .from('whatsapp_queue')
     .update({
       status: 'failed',
-      error: err.slice(0, 500),
+      error: err,
       retry_count: (row.retry_count ?? 0) + 1
     })
     .eq('id', row.id)
   await supabase
     .from('whatsapp_messages_log')
-    .update({ status: 'failed', error: err.slice(0, 500) })
+    .update({ status: 'failed', error: err })
     .eq('queue_id', row.id)
   return true
 }
@@ -944,7 +949,25 @@ async function sendOnce (row) {
     logger.debug({ queueId, jid, resolution, ...meta }, '[wa-worker] resolved JID')
   }
 
-  await s.sendMessage(jid, { text: String(row.message_body ?? '') })
+  const bodyText = String(row.message_body ?? '')
+  const hasMediaRecipientType = String(row.recipient_type ?? '').trim().startsWith('media:')
+  const hasJsonMediaBody = looksLikeAssignmentMediaPayload(bodyText)
+  const shouldSendMedia =
+    messageType === ASSIGNMENT_MEDIA_MESSAGE_TYPE ||
+    hasMediaRecipientType ||
+    hasJsonMediaBody
+
+  if (shouldSendMedia) {
+    if (messageType !== ASSIGNMENT_MEDIA_MESSAGE_TYPE && (hasMediaRecipientType || hasJsonMediaBody)) {
+      logger.warn(
+        { queueId, messageType },
+        '[wa-worker] media payload detected but message_type is unexpected — sending as media anyway'
+      )
+    }
+    await sendAssignmentMedia(s, jid, row)
+  } else {
+    await s.sendMessage(jid, { text: bodyText })
+  }
 
   logger.info({ queueId, jid, messageType, resolution }, '[wa-worker] sendMessage OK')
 }
