@@ -813,6 +813,16 @@ async function resolveRecipientJid (tenantId, sock, recipientRaw) {
 const LATE_START_MESSAGE_TYPES = new Set(['class_reminder_late', 'class_reminder_teacher_late'])
 const ASSIGNMENT_MEDIA_MESSAGE_TYPE = 'assignment_created_parent_media'
 
+function looksLikeLateStartReminder (row) {
+  const messageType = row.message_type ?? ''
+  if (LATE_START_MESSAGE_TYPES.has(messageType)) return true
+  const body = String(row.message_body ?? '').toLowerCase()
+  return body.includes('تنبيه تأخر') ||
+    body.includes('تأخر بدء الحصة') ||
+    body.includes('late class start') ||
+    body.includes('late start')
+}
+
 function looksLikeAssignmentMediaPayload (rawBody) {
   const s = String(rawBody ?? '').trim()
   if (!s.startsWith('{') || !s.endsWith('}')) return false
@@ -969,11 +979,10 @@ async function deleteAssignmentAttachmentAfterSend (row, media) {
  * @returns {Promise<boolean>} true if row was abandoned (caller must not send)
  */
 async function abandonStaleLateReminderIfNeeded (row) {
-  const messageType = row.message_type ?? ''
-  if (!LATE_START_MESSAGE_TYPES.has(messageType)) return false
+  if (!looksLikeLateStartReminder(row)) return false
   const err = 'late_start_reminders_disabled'
   logger.info(
-    { queueId: row.id, messageType, sessionId: row.session_id },
+    { queueId: row.id, messageType: row.message_type ?? '', sessionId: row.session_id },
     '[wa-worker] abandoning disabled late-start reminder'
   )
   await supabase
