@@ -974,29 +974,24 @@ async function deleteAssignmentAttachmentAfterSend (row, media) {
 }
 
 /**
- * Late-start messages are disabled; abandon any queued backlog so only normal
- * class reminders are sent.
- * @returns {Promise<boolean>} true if row was abandoned (caller must not send)
+ * Late-start messages are not sent; drop queue + log rows so backlog does not
+ * accumulate bodies or failed rows in the DB / admin UI.
+ * @returns {Promise<boolean>} true if row was removed (caller must not send)
  */
 async function abandonStaleLateReminderIfNeeded (row) {
   if (!looksLikeLateStartReminder(row)) return false
-  const err = 'late_start_reminders_disabled'
   logger.info(
     { queueId: row.id, messageType: row.message_type ?? '', sessionId: row.session_id },
-    '[wa-worker] abandoning disabled late-start reminder'
+    '[wa-worker] deleting disabled late-start reminder row'
   )
   await supabase
-    .from('whatsapp_queue')
-    .update({
-      status: 'failed',
-      error: err,
-      retry_count: (row.retry_count ?? 0) + 1
-    })
-    .eq('id', row.id)
-  await supabase
     .from('whatsapp_messages_log')
-    .update({ status: 'failed', error: err })
+    .delete()
     .eq('queue_id', row.id)
+  await supabase
+    .from('whatsapp_queue')
+    .delete()
+    .eq('id', row.id)
   return true
 }
 
