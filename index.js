@@ -97,8 +97,25 @@ logger.info(
 
 const SESSION_LABEL = 'default'
 
-/** @type {Map<string, string>} last pairing_requested_at ISO we started handling */
+/** @type {Map<string, string>} last pairing_requested_at (ISO string) we started handling */
 const pairingHandled = new Map()
+
+/** Skip redundant DB writes when Baileys repeats the same QR payload */
+const lastPairingQrWritten = new Map()
+
+/**
+ * Stable key for pairing_requested_at. node-pg returns a fresh Date per query;
+ * comparing with !== would always differ from a stored Date and restart pairing every poll.
+ */
+function normPairingRequestedAt (v) {
+  if (v == null || v === '') return ''
+  if (v instanceof Date) return v.toISOString()
+  const s = String(v).trim()
+  if (!s) return ''
+  const d = new Date(s)
+  if (!Number.isNaN(d.getTime())) return d.toISOString()
+  return s
+}
 
 function tenantAuthDir (tenantId) {
   return resolve(authRoot, tenantId)
@@ -279,6 +296,7 @@ async function wipeTenantAuth (tenantId, reason) {
     { tenantId, reason, failures: tenantSessionFailures.get(tenantId) },
     '[wa-worker] wiping tenant auth — repair required'
   )
+  lastPairingQrWritten.delete(tenantId)
   pairingHandled.delete(tenantId)
   resetSessionFailures(tenantId)
   await destroyTenantSocket(tenantId)
@@ -314,6 +332,7 @@ async function processLogout (tenantId) {
     }
   }
   tenantSockets.delete(tenantId)
+  lastPairingQrWritten.delete(tenantId)
   pairingHandled.delete(tenantId)
   resetSessionFailures(tenantId)
   try {
@@ -422,6 +441,7 @@ function scheduleReconnectPairing (tenantId, delayMs, closeMeta) {
  */
 async function startSocket (tenantId, ctx) {
   await destroyTenantSocket(tenantId)
+  lastPairingQrWritten.delete(tenantId)
 
   let version = null
   try {
@@ -479,20 +499,25 @@ async function startSocket (tenantId, ctx) {
     }
 
     if (qr) {
-      void updateSession(tenantId, {
-        pairing_qr: qr,
-        status: 'pairing',
-        last_error: null
-      })
-      logger.info(
-        { tenantId, qrPayloadChars: String(qr).length },
-        '[wa-worker] QR written to DB (scan in admin settings)'
-      )
+      const prevQr = lastPairingQrWritten.get(tenantId)
+      if (prevQr !== qr) {
+        lastPairingQrWritten.set(tenantId, qr)
+        void updateSession(tenantId, {
+          pairing_qr: qr,
+          status: 'pairing',
+          last_error: null
+        })
+        logger.info(
+          { tenantId, qrPayloadChars: String(qr).length },
+          '[wa-worker] QR written to DB (scan in admin settings)'
+        )
+      }
     }
 
     if (connection === 'open') {
       const wid = sock.user?.id ?? null
       logger.info({ tenantId, loggedInJid: wid }, '[wa-worker] WhatsApp connected')
+      lastPairingQrWritten.delete(tenantId)
       pairingHandled.delete(tenantId)
       resetSessionFailures(tenantId)
       void updateSession(tenantId, {
@@ -532,6 +557,7 @@ async function startSocket (tenantId, ctx) {
       tenantSockets.delete(tenantId)
 
       if (loggedOut) {
+        lastPairingQrWritten.delete(tenantId)
         pairingHandled.delete(tenantId)
         resetSessionFailures(tenantId)
         void rm(tenantAuthDir(tenantId), { recursive: true, force: true }).catch(() => {})
@@ -552,7 +578,7 @@ async function startSocket (tenantId, ctx) {
           worker_checked_at: new Date().toISOString()
         })
         if (code === DisconnectReason.restartRequired) {
-          scheduleReconnectPairing(tenantId, 500, { code, reasonLabel })
+          scheduleReconnectPairing(tenantId, 1600, { code, reasonLabel })
           return
         }
         logger.info(
@@ -655,9 +681,13 @@ async function pollSessions () {
       }
 
       if (row.pairing_requested_at) {
+        const nextPr = normPairingRequestedAt(row.pairing_requested_at)
+        if (!nextPr) {
+          continue
+        }
         const prev = pairingHandled.get(tid)
-        if (prev !== row.pairing_requested_at) {
-          pairingHandled.set(tid, row.pairing_requested_at)
+        if (prev !== nextPr) {
+          pairingHandled.set(tid, nextPr)
           const meta =
             row.metadata && typeof row.metadata === 'object' && !Array.isArray(row.metadata)
               ? { ...row.metadata }

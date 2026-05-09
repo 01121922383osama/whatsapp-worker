@@ -48,6 +48,8 @@ npm start
 
 **Pairing:** use **Admin → Settings → WhatsApp** for that academy: “Show QR code to link WhatsApp”. The worker writes the QR into the database; scan it with WhatsApp → Linked devices. Persist the **`auth_info_baileys`** directory (or a Railway volume mounted there) across deploys.
 
+**One worker per database:** do not run multiple replicas of this process for the same `DATABASE_URL`. Competing processes will reconnect and rotate QR codes, and phones often show “couldn’t link device”.
+
 ## Keep sessions across deploys (important)
 
 If WhatsApp disconnects after every deploy, your auth files are likely on ephemeral disk.
