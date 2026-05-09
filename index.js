@@ -1,5 +1,5 @@
 /**
- * Multi-tenant Baileys worker — reads `whatsapp_queue` and `whatsapp_sessions` from Supabase.
+ * Multi-tenant Baileys worker — reads `whatsapp_queue` and `whatsapp_sessions` from Postgres.
  *
  * Auth files live at `auth_info_baileys/<tenant_id>/` (one WhatsApp account per academy).
  * Legacy single-folder auth: move `auth_info_baileys/*` into `auth_info_baileys/<your-tenant-uuid>/`.
@@ -11,6 +11,7 @@ import { existsSync } from 'fs'
 import { rm } from 'fs/promises'
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
+import pg from 'pg'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -23,7 +24,6 @@ for (const p of envPaths) {
   if (existsSync(p)) loadEnv({ path: p, override: true })
 }
 
-import { createClient } from '@supabase/supabase-js'
 import makeWASocket, {
   DisconnectReason,
   fetchLatestBaileysVersion,
@@ -50,41 +50,50 @@ function disconnectReasonLabel (code) {
   return `code_${code}`
 }
 
-function supabaseHostHint () {
+const databaseUrl = (process.env.DATABASE_URL || '').trim()
+
+function dbHostHint () {
   try {
-    return new URL(url).host
+    const normalized = databaseUrl.replace(/^postgres(ql)?:\/\//i, 'http://')
+    return new URL(normalized).host
   } catch {
-    return '(invalid url)'
+    return '(invalid DATABASE_URL)'
   }
 }
 
-const url = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL || '').trim()
-const key = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim()
 const pollMs = Number(process.env.WORKER_POLL_MS) || 8000
-const sessionPollMs = Number(process.env.WORKER_SESSION_POLL_MS) || 2500
+/** Default lowered DB pressure vs 2500ms; override with WORKER_SESSION_POLL_MS. */
+const sessionPollMs = Number(process.env.WORKER_SESSION_POLL_MS) || 5000
 const authRootRaw = (process.env.WA_AUTH_ROOT || '').trim()
 const authRoot = authRootRaw
   ? resolve(authRootRaw)
   : resolve(__dirname, 'auth_info_baileys')
 
-if (!url || !key) {
-  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY')
+if (!databaseUrl) {
+  console.error('Missing DATABASE_URL')
   process.exit(1)
 }
+
+const pool = new pg.Pool({
+  connectionString: databaseUrl,
+  max: 8,
+  idleTimeoutMillis: 30_000,
+  ssl: /localhost|127\.0\.0\.1/i.test(databaseUrl)
+    ? false
+    : { rejectUnauthorized: false }
+})
 
 logger.info(
   {
     pollMs,
     sessionPollMs,
     logLevel,
-    supabaseHost: supabaseHostHint(),
+    dbHost: dbHostHint(),
     authRoot,
     authRootFromEnv: Boolean(authRootRaw)
   },
   '[wa-worker] starting'
 )
-
-const supabase = createClient(url, key)
 
 const SESSION_LABEL = 'default'
 
@@ -188,31 +197,33 @@ function previewBody (text, max = 160) {
 }
 
 async function updateSession (tenantId, patch) {
-  const { error, data } = await supabase
-    .from('whatsapp_sessions')
-    .update({
-      ...patch,
-      updated_at: new Date().toISOString()
-    })
-    .eq('tenant_id', tenantId)
-    .eq('label', SESSION_LABEL)
-    .select('id')
-    .maybeSingle()
-  if (error) {
+  const merged = { ...patch, updated_at: new Date().toISOString() }
+  const fragments = []
+  const params = [tenantId, SESSION_LABEL]
+  let i = 3
+  for (const [col, val] of Object.entries(merged)) {
+    fragments.push(`${col} = $${i}`)
+    params.push(val)
+    i += 1
+  }
+  try {
+    const res = await pool.query(
+      `update public.whatsapp_sessions set ${fragments.join(', ')}
+       where tenant_id = $1::uuid and label = $2
+       returning id`,
+      params
+    )
+    if (logDebug && res.rowCount) {
+      logger.debug({ tenantId, keys: Object.keys(patch) }, '[wa-worker] session row updated')
+    }
+  } catch (err) {
     logger.error(
       {
         tenantId,
-        err: error.message,
-        code: error.code,
-        details: error.details,
-        hint: error.hint
+        err: err instanceof Error ? err.message : String(err)
       },
       '[wa-worker] session update failed'
     )
-    return
-  }
-  if (logDebug && data) {
-    logger.debug({ tenantId, keys: Object.keys(patch) }, '[wa-worker] session row updated')
   }
 }
 
@@ -371,15 +382,17 @@ function scheduleReconnectPairing (tenantId, delayMs, closeMeta) {
         logger.debug({ tenantId }, '[wa-worker] pairing reconnect skipped — socket already exists')
         return
       }
-      const { data: row, error } = await supabase
-        .from('whatsapp_sessions')
-        .select('pairing_requested_at')
-        .eq('tenant_id', tenantId)
-        .eq('label', SESSION_LABEL)
-        .maybeSingle()
-      if (error) {
+      let row = null
+      try {
+        const res = await pool.query(
+          `select pairing_requested_at from public.whatsapp_sessions
+           where tenant_id = $1::uuid and label = $2 limit 1`,
+          [tenantId, SESSION_LABEL]
+        )
+        row = res.rows[0] ?? null
+      } catch (err) {
         logger.warn(
-          { tenantId, err: error.message },
+          { tenantId, err: err instanceof Error ? err.message : String(err) },
           '[wa-worker] pairing reconnect skipped — session read failed'
         )
         return
@@ -610,16 +623,21 @@ async function startSocket (tenantId, ctx) {
   return sock
 }
 
+const SESSION_POLL_COLUMNS =
+  'tenant_id,logout_requested_at,pairing_requested_at,metadata,linked_wa_jid,status'
+
 async function pollSessions () {
   try {
-    const { data: rows, error } = await supabase
-      .from('whatsapp_sessions')
-      .select('*')
-      .eq('label', SESSION_LABEL)
-
-    if (error) {
+    let rows = []
+    try {
+      const res = await pool.query(
+        `select ${SESSION_POLL_COLUMNS} from public.whatsapp_sessions where label = $1`,
+        [SESSION_LABEL]
+      )
+      rows = res.rows
+    } catch (err) {
       logger.error(
-        { err: error.message, code: error.code, details: error.details },
+        { err: err instanceof Error ? err.message : String(err) },
         '[wa-worker] session poll query failed'
       )
       return
@@ -700,21 +718,23 @@ async function pollSessions () {
       }
     }
 
-    const tick = new Date().toISOString()
-    for (const row of rows ?? []) {
-      const { error: tickErr } = await supabase
-        .from('whatsapp_sessions')
-        .update({ worker_checked_at: tick })
-        .eq('tenant_id', row.tenant_id)
-        .eq('label', SESSION_LABEL)
-      if (tickErr) {
+    const list = rows ?? []
+    if (list.length > 0) {
+      const tick = new Date().toISOString()
+      const tenantIds = list.map((r) => r.tenant_id)
+      try {
+        await pool.query(
+          `update public.whatsapp_sessions set worker_checked_at = $1::timestamptz
+           where label = $2 and tenant_id = any($3::uuid[])`,
+          [tick, SESSION_LABEL, tenantIds]
+        )
+      } catch (tickErr) {
         logger.error(
           {
-            tenantId: row.tenant_id,
-            err: tickErr.message,
-            code: tickErr.code
+            tenantCount: tenantIds.length,
+            err: tickErr instanceof Error ? tickErr.message : String(tickErr)
           },
-          '[wa-worker] worker_checked_at heartbeat failed'
+          '[wa-worker] worker_checked_at batch heartbeat failed'
         )
       }
     }
@@ -812,6 +832,7 @@ async function resolveRecipientJid (tenantId, sock, recipientRaw) {
 
 const LATE_START_MESSAGE_TYPES = new Set(['class_reminder_late', 'class_reminder_teacher_late'])
 const ASSIGNMENT_MEDIA_MESSAGE_TYPE = 'assignment_created_parent_media'
+const SESSION_HOMEWORK_MEDIA_MESSAGE_TYPE = 'session_attendance_homework_media'
 
 function looksLikeLateStartReminder (row) {
   const messageType = row.message_type ?? ''
@@ -823,7 +844,7 @@ function looksLikeLateStartReminder (row) {
     body.includes('late start')
 }
 
-function looksLikeAssignmentMediaPayload (rawBody) {
+function looksLikeQueuedMediaPayload (rawBody) {
   const s = String(rawBody ?? '').trim()
   if (!s.startsWith('{') || !s.endsWith('}')) return false
   try {
@@ -831,7 +852,8 @@ function looksLikeAssignmentMediaPayload (rawBody) {
     const bucket = String(parsed?.bucket ?? '').trim()
     const path = String(parsed?.path ?? '').trim()
     const kind = parsed?.kind === 'image' ? 'image' : parsed?.kind === 'pdf' ? 'pdf' : ''
-    return bucket === 'assignments' && Boolean(path) && Boolean(kind)
+    const okBucket = bucket === 'assignments' || bucket === 'session_homework'
+    return okBucket && Boolean(path) && Boolean(kind)
   } catch {
     return false
   }
@@ -848,7 +870,7 @@ function parseMediaPayloadFromRecipientType (recipientType) {
   }
 }
 
-function parseAssignmentMediaBody (row) {
+function parseQueuedMediaPayload (row) {
   const parsedFromRecipientType = parseMediaPayloadFromRecipientType(row.recipient_type)
   let parsed = parsedFromRecipientType
   if (!parsed) {
@@ -861,39 +883,93 @@ function parseAssignmentMediaBody (row) {
 
   const bucket = String(parsed?.bucket ?? '').trim()
   const path = String(parsed?.path ?? '').trim()
-  const fileName = String(parsed?.fileName ?? '').trim() || 'assignment-file'
+  const fileName = String(parsed?.fileName ?? '').trim() || 'file'
   const kind = parsed?.kind === 'image' ? 'image' : parsed?.kind === 'pdf' ? 'pdf' : ''
   const mimeType = String(parsed?.mimeType ?? '').trim() ||
     (kind === 'pdf' ? 'application/pdf' : 'image/jpeg')
-  const tenantId = String(parsed?.tenantId ?? '').trim()
-  const assignmentId = String(parsed?.assignmentId ?? '').trim()
+  const tenantIdJson = String(parsed?.tenantId ?? '').trim()
 
-  if (bucket !== 'assignments' || !path || !kind) {
+  if (bucket !== 'assignments' && bucket !== 'session_homework') {
+    throw new Error('invalid_media_payload')
+  }
+  if (!path || !kind) {
     throw new Error('invalid_media_payload')
   }
   if (!path.startsWith(`${row.tenant_id}/`)) {
     throw new Error('media_path_tenant_mismatch')
   }
-  if (tenantId && tenantId !== row.tenant_id) {
+  if (tenantIdJson && tenantIdJson !== row.tenant_id) {
     throw new Error('media_tenant_mismatch')
   }
 
-  return { bucket, path, fileName, kind, mimeType, assignmentId }
-}
-
-async function downloadStorageMedia (media) {
-  const { data, error } = await supabase.storage
-    .from(media.bucket)
-    .download(media.path)
-  if (error || !data) {
-    throw new Error(`media_download_failed:${error?.message ?? 'empty'}`)
+  if (bucket === 'assignments') {
+    const assignmentId = String(parsed?.assignmentId ?? '').trim()
+    return { bucket, path, fileName, kind, mimeType, assignmentId }
   }
-  return Buffer.from(await data.arrayBuffer())
+
+  const sessionId = String(parsed?.sessionId ?? '').trim()
+  if (!sessionId) {
+    throw new Error('invalid_media_payload')
+  }
+  const sessionIdFromRow = row.session_id ? String(row.session_id).trim() : ''
+  if (sessionIdFromRow && sessionIdFromRow !== sessionId) {
+    throw new Error('media_session_mismatch')
+  }
+  return { bucket, path, fileName, kind, mimeType, sessionId }
 }
 
-async function sendAssignmentMedia (sock, jid, row) {
-  const media = parseAssignmentMediaBody(row)
-  const buffer = await downloadStorageMedia(media)
+function queuedMediaPublicBaseUrl (bucket) {
+  if (bucket === 'assignments') {
+    return (process.env.R2_ASSIGNMENTS_PUBLIC_BASE_URL || '').trim().replace(/\/$/, '')
+  }
+  if (bucket === 'session_homework') {
+    return (process.env.R2_SESSION_HOMEWORK_PUBLIC_BASE_URL
+      || process.env.R2_ASSIGNMENT_FEEDBACK_PUBLIC_BASE_URL || '').trim().replace(/\/$/, '')
+  }
+  return ''
+}
+
+function queuedMediaDeleteBaseUrl (bucket) {
+  if (bucket === 'assignments') {
+    return (process.env.R2_ASSIGNMENTS_DELETE_BASE_URL || process.env.R2_ASSIGNMENTS_PUT_BASE_URL || '')
+      .trim()
+      .replace(/\/$/, '')
+  }
+  if (bucket === 'session_homework') {
+    return (process.env.R2_SESSION_HOMEWORK_DELETE_BASE_URL
+      || process.env.R2_SESSION_HOMEWORK_PUT_BASE_URL
+      || process.env.R2_ASSIGNMENT_FEEDBACK_DELETE_BASE_URL
+      || '').trim().replace(/\/$/, '')
+  }
+  return ''
+}
+
+async function downloadQueuedStorageMedia (media) {
+  const base = queuedMediaPublicBaseUrl(media.bucket)
+  if (!base) {
+    throw new Error(`media_download_failed:missing_public_base:${media.bucket}`)
+  }
+  const rel = String(media.path ?? '').replace(/^\//, '')
+  const url = `${base}/${rel}`
+  const res = await fetch(url)
+  if (!res.ok) {
+    throw new Error(`media_download_failed:${res.status}`)
+  }
+  return Buffer.from(await res.arrayBuffer())
+}
+
+function documentSendFileName (media) {
+  const name = String(media.fileName ?? '').trim() || 'attachment'
+  if (media.bucket === 'session_homework' || media.bucket === 'assignments') {
+    if (/\.pdf$/i.test(name)) return name
+    return `${name.replace(/\.[^/.]+$/, '')}.pdf`
+  }
+  return 'attachment.pdf'
+}
+
+async function sendQueuedMedia (sock, jid, row) {
+  const media = parseQueuedMediaPayload(row)
+  const buffer = await downloadQueuedStorageMedia(media)
 
   if (media.kind === 'image') {
     await sock.sendMessage(jid, {
@@ -906,31 +982,186 @@ async function sendAssignmentMedia (sock, jid, row) {
   await sock.sendMessage(jid, {
     document: buffer,
     mimetype: media.mimeType || 'application/pdf',
-    fileName: 'assignment.pdf'
+    fileName: documentSendFileName(media)
   })
 }
 
-async function deleteAssignmentAttachmentAfterSend (row, media) {
-  const { error: rmErr } = await supabase.storage.from(media.bucket).remove([media.path])
-  if (rmErr) {
-    logger.warn(
-      { queueId: row.id, tenantId: row.tenant_id, path: media.path, err: rmErr.message },
-      '[wa-worker] storage remove failed (continuing)'
+async function cleanupSessionHomeworkReportAfterSend (row, media) {
+  const sessionId = media.sessionId
+  if (!sessionId) return
+
+  let sess = null
+  try {
+    const sRes = await pool.query(
+      `select id, session_report from public.sessions
+       where id = $1::uuid and tenant_id = $2::uuid limit 1`,
+      [sessionId, row.tenant_id]
     )
+    sess = sRes.rows[0] ?? null
+  } catch (sErr) {
+    logger.warn(
+      {
+        queueId: row.id,
+        sessionId,
+        err: sErr instanceof Error ? sErr.message : String(sErr)
+      },
+      '[wa-worker] session fetch failed for homework attachment cleanup'
+    )
+    return
   }
 
+  if (!sess) {
+    logger.warn(
+      { queueId: row.id, sessionId },
+      '[wa-worker] session not found for homework attachment cleanup'
+    )
+    return
+  }
+
+  const report =
+    sess.session_report && typeof sess.session_report === 'object' && !Array.isArray(sess.session_report)
+      ? { ...sess.session_report }
+      : {}
+
+  const rawAttachments = report.homework_attachments
+  if (!Array.isArray(rawAttachments)) return
+
+  const nextAttachments = rawAttachments.filter((item) => {
+    if (!item || typeof item !== 'object') return true
+    const p = String(item.path ?? '').trim()
+    return p !== media.path
+  })
+  if (nextAttachments.length === rawAttachments.length) return
+
+  if (nextAttachments.length > 0) {
+    report.homework_attachments = nextAttachments
+  } else {
+    delete report.homework_attachments
+  }
+
+  try {
+    await pool.query(
+      `update public.sessions set session_report = $1::jsonb
+       where id = $2::uuid and tenant_id = $3::uuid`,
+      [JSON.stringify(report), sessionId, row.tenant_id]
+    )
+  } catch (uErr) {
+    logger.warn(
+      {
+        queueId: row.id,
+        sessionId,
+        err: uErr instanceof Error ? uErr.message : String(uErr)
+      },
+      '[wa-worker] session_report update failed after homework media send'
+    )
+  }
+}
+
+async function tryDeleteObjectViaS3 (objectKey) {
+  const endpoint = (process.env.S3_ENDPOINT || '').trim().replace(/\/$/, '')
+  const bucket = (process.env.S3_BUCKET || '').trim()
+  const accessKeyId = (process.env.S3_ACCESS_KEY_ID || '').trim()
+  const secretAccessKey = (process.env.S3_SECRET_ACCESS_KEY || '').trim()
+  if (!endpoint || !bucket || !accessKeyId || !secretAccessKey) return false
+  const { S3Client, DeleteObjectCommand } = await import('@aws-sdk/client-s3')
+  const region = (process.env.S3_REGION || 'auto').trim()
+  const forcePathStyle = String(process.env.S3_FORCE_PATH_STYLE || '').toLowerCase() !== 'false'
+  const client = new S3Client({
+    region,
+    endpoint,
+    credentials: { accessKeyId, secretAccessKey },
+    forcePathStyle,
+    requestChecksumCalculation: 'WHEN_REQUIRED',
+    responseChecksumValidation: 'WHEN_REQUIRED'
+  })
+  await client.send(new DeleteObjectCommand({
+    Bucket: bucket,
+    Key: String(objectKey ?? '').replace(/^\//, '')
+  }))
+  return true
+}
+
+async function cleanupAfterQueuedMediaSend (row, media) {
+  const delBase = queuedMediaDeleteBaseUrl(media.bucket)
+  const relPath = String(media.path ?? '').replace(/^\//, '')
+  if (delBase) {
+    try {
+      const res = await fetch(`${delBase}/${relPath}`, { method: 'DELETE' })
+      if (!res.ok && res.status !== 404) {
+        logger.warn(
+          { queueId: row.id, tenantId: row.tenant_id, path: media.path, bucket: media.bucket, status: res.status },
+          '[wa-worker] storage delete failed (continuing)'
+        )
+      }
+    } catch (err) {
+      logger.warn(
+        {
+          queueId: row.id,
+          tenantId: row.tenant_id,
+          path: media.path,
+          err: err instanceof Error ? err.message : String(err)
+        },
+        '[wa-worker] storage delete failed (continuing)'
+      )
+    }
+  } else {
+    try {
+      const didS3 = await tryDeleteObjectViaS3(relPath)
+      if (!didS3) {
+        const hint =
+          media.bucket === 'session_homework'
+            ? '(set R2 delete/put base or S3_* on this worker)'
+            : '(set R2_ASSIGNMENTS_DELETE_BASE_URL or R2_ASSIGNMENTS_PUT_BASE_URL, or S3_* on this worker)'
+        logger.warn(
+          { queueId: row.id, path: media.path, bucket: media.bucket },
+          `[wa-worker] storage delete skipped ${hint}`
+        )
+      }
+    } catch (s3Err) {
+      logger.warn(
+        {
+          queueId: row.id,
+          path: media.path,
+          err: s3Err instanceof Error ? s3Err.message : String(s3Err)
+        },
+        '[wa-worker] S3 storage delete failed (continuing)'
+      )
+    }
+  }
+
+  if (media.bucket === 'assignments') {
+    await cleanupAssignmentsAttachmentsDbAfterSend(row, media)
+  } else if (media.bucket === 'session_homework') {
+    await cleanupSessionHomeworkReportAfterSend(row, media)
+  }
+}
+
+async function cleanupAssignmentsAttachmentsDbAfterSend (row, media) {
   if (!media.assignmentId) return
 
-  const { data: assignment, error: aErr } = await supabase
-    .from('assignments')
-    .select('id, tenant_id, content, file_url')
-    .eq('id', media.assignmentId)
-    .eq('tenant_id', row.tenant_id)
-    .maybeSingle()
-
-  if (aErr || !assignment) {
+  let assignment = null
+  try {
+    const aRes = await pool.query(
+      `select id, tenant_id, content, file_url from public.assignments
+       where id = $1::uuid and tenant_id = $2::uuid limit 1`,
+      [media.assignmentId, row.tenant_id]
+    )
+    assignment = aRes.rows[0] ?? null
+  } catch (aErr) {
     logger.warn(
-      { queueId: row.id, assignmentId: media.assignmentId, err: aErr?.message },
+      {
+        queueId: row.id,
+        assignmentId: media.assignmentId,
+        err: aErr instanceof Error ? aErr.message : String(aErr)
+      },
+      '[wa-worker] assignment fetch failed for attachment cleanup'
+    )
+    return
+  }
+
+  if (!assignment) {
+    logger.warn(
+      { queueId: row.id, assignmentId: media.assignmentId },
       '[wa-worker] assignment fetch failed for attachment cleanup'
     )
     return
@@ -956,18 +1187,19 @@ async function deleteAssignmentAttachmentAfterSend (row, media) {
 
   const nextFileUrl = assignment.file_url === media.path ? null : assignment.file_url
 
-  const { error: uErr } = await supabase
-    .from('assignments')
-    .update({
-      content,
-      file_url: nextFileUrl
-    })
-    .eq('id', media.assignmentId)
-    .eq('tenant_id', row.tenant_id)
-
-  if (uErr) {
+  try {
+    await pool.query(
+      `update public.assignments set content = $1::jsonb, file_url = $2
+       where id = $3::uuid and tenant_id = $4::uuid`,
+      [content, nextFileUrl, media.assignmentId, row.tenant_id]
+    )
+  } catch (uErr) {
     logger.warn(
-      { queueId: row.id, assignmentId: media.assignmentId, err: uErr.message },
+      {
+        queueId: row.id,
+        assignmentId: media.assignmentId,
+        err: uErr instanceof Error ? uErr.message : String(uErr)
+      },
       '[wa-worker] assignment content update failed after send'
     )
   }
@@ -984,14 +1216,11 @@ async function abandonStaleLateReminderIfNeeded (row) {
     { queueId: row.id, messageType: row.message_type ?? '', sessionId: row.session_id },
     '[wa-worker] deleting disabled late-start reminder row'
   )
-  await supabase
-    .from('whatsapp_messages_log')
-    .delete()
-    .eq('queue_id', row.id)
-  await supabase
-    .from('whatsapp_queue')
-    .delete()
-    .eq('id', row.id)
+  await pool.query(
+    'delete from public.whatsapp_messages_log where queue_id = $1::uuid',
+    [row.id]
+  )
+  await pool.query('delete from public.whatsapp_queue where id = $1::uuid', [row.id])
   return true
 }
 
@@ -1022,23 +1251,28 @@ async function sendOnce (row) {
 
   const bodyText = String(row.message_body ?? '')
   const hasMediaRecipientType = String(row.recipient_type ?? '').trim().startsWith('media:')
-  const hasJsonMediaBody = looksLikeAssignmentMediaPayload(bodyText)
+  const hasJsonMediaBody = looksLikeQueuedMediaPayload(bodyText)
   const shouldSendMedia =
     messageType === ASSIGNMENT_MEDIA_MESSAGE_TYPE ||
+    messageType === SESSION_HOMEWORK_MEDIA_MESSAGE_TYPE ||
     hasMediaRecipientType ||
     hasJsonMediaBody
 
   if (shouldSendMedia) {
-    if (messageType !== ASSIGNMENT_MEDIA_MESSAGE_TYPE && (hasMediaRecipientType || hasJsonMediaBody)) {
+    if (
+      messageType !== ASSIGNMENT_MEDIA_MESSAGE_TYPE &&
+      messageType !== SESSION_HOMEWORK_MEDIA_MESSAGE_TYPE &&
+      (hasMediaRecipientType || hasJsonMediaBody)
+    ) {
       logger.warn(
         { queueId, messageType },
         '[wa-worker] media payload detected but message_type is unexpected — sending as media anyway'
       )
     }
-    await sendAssignmentMedia(s, jid, row)
+    await sendQueuedMedia(s, jid, row)
     try {
-      const media = parseAssignmentMediaBody(row)
-      await deleteAssignmentAttachmentAfterSend(row, media)
+      const media = parseQueuedMediaPayload(row)
+      await cleanupAfterQueuedMediaSend(row, media)
     } catch (e) {
       logger.warn(
         { queueId, err: e instanceof Error ? e.message : String(e) },
@@ -1055,23 +1289,26 @@ async function sendOnce (row) {
 async function pollLoop () {
   for (;;) {
     try {
-      const { data: rows, error } = await supabase
-        .from('whatsapp_queue')
-        .select(
-          'id, tenant_id, recipient_phone, message_type, recipient_type, message_body, status, retry_count, session_id'
+      let rows = []
+      try {
+        const res = await pool.query(
+          `select id, tenant_id, recipient_phone, message_type, recipient_type, message_body, status, retry_count, session_id
+           from public.whatsapp_queue
+           where (status is null or status = 'pending')
+             and scheduled_at <= $1::timestamptz
+           order by scheduled_at asc, id asc
+           limit 5`,
+          [new Date().toISOString()]
         )
-        .or('status.is.null,status.eq.pending')
-        .lte('scheduled_at', new Date().toISOString())
-        .order('scheduled_at', { ascending: true })
-        .order('id', { ascending: true })
-        .limit(5)
-
-      if (error) {
+        rows = res.rows
+      } catch (error) {
         logger.error(
-          { err: error.message, code: error.code, details: error.details },
+          { err: error instanceof Error ? error.message : String(error) },
           '[wa-worker] poll query failed'
         )
-      } else if (rows?.length) {
+      }
+
+      if (rows?.length) {
         if (logDebug) {
           logger.debug({ count: rows.length }, '[wa-worker] fetched pending rows')
         }
@@ -1086,20 +1323,18 @@ async function pollLoop () {
               const deferMs = 60_000 + (String(row.id).charCodeAt(0) % 45) * 1000
               const deferredUntil = new Date(Date.now() + deferMs).toISOString()
               /** Always bump schedule so one dead tenant cannot starve others in the same DB (FIFO poll). */
-              await supabase
-                .from('whatsapp_queue')
-                .update({ scheduled_at: deferredUntil })
-                .eq('id', row.id)
-              await supabase
-                .from('whatsapp_queue')
-                .update({ error: notLinkedErr })
-                .eq('id', row.id)
-                .is('error', null)
-              await supabase
-                .from('whatsapp_messages_log')
-                .update({ error: notLinkedErr })
-                .eq('queue_id', row.id)
-                .is('error', null)
+              await pool.query(
+                `update public.whatsapp_queue set scheduled_at = $1::timestamptz where id = $2::uuid`,
+                [deferredUntil, row.id]
+              )
+              await pool.query(
+                `update public.whatsapp_queue set error = $1 where id = $2::uuid and error is null`,
+                [notLinkedErr, row.id]
+              )
+              await pool.query(
+                `update public.whatsapp_messages_log set error = $1 where queue_id = $2::uuid and error is null`,
+                [notLinkedErr, row.id]
+              )
               const now = Date.now()
               const last = notLinkedLastLogged.get(row.tenant_id) ?? 0
               if (now - last > NOT_LINKED_LOG_INTERVAL_MS) {
@@ -1113,18 +1348,17 @@ async function pollLoop () {
             }
             await sendOnce(row)
             resetSessionFailures(row.tenant_id)
-            await supabase
-              .from('whatsapp_queue')
-              .update({
-                status: 'sent',
-                sent_at: new Date().toISOString(),
-                error: null
-              })
-              .eq('id', row.id)
-            await supabase
-              .from('whatsapp_messages_log')
-              .update({ status: 'sent', error: null })
-              .eq('queue_id', row.id)
+            const sentAt = new Date().toISOString()
+            await pool.query(
+              `update public.whatsapp_queue
+               set status = 'sent', sent_at = $1::timestamptz, error = null
+               where id = $2::uuid`,
+              [sentAt, row.id]
+            )
+            await pool.query(
+              `update public.whatsapp_messages_log set status = 'sent', error = null where queue_id = $1::uuid`,
+              [row.id]
+            )
             logger.info({ queueId: row.id }, '[wa-worker] DB updated: sent')
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e)
@@ -1200,21 +1434,18 @@ async function pollLoop () {
               },
               '[wa-worker] send failed'
             )
-            await supabase
-              .from('whatsapp_queue')
-              .update({
-                status: failed ? 'failed' : 'pending',
-                error: msg,
-                retry_count: rc
-              })
-              .eq('id', row.id)
-            await supabase
-              .from('whatsapp_messages_log')
-              .update({
-                status: failed ? 'failed' : 'pending',
-                error: msg
-              })
-              .eq('queue_id', row.id)
+            await pool.query(
+              `update public.whatsapp_queue
+               set status = $1, error = $2, retry_count = $3
+               where id = $4::uuid`,
+              [failed ? 'failed' : 'pending', msg, rc, row.id]
+            )
+            await pool.query(
+              `update public.whatsapp_messages_log
+               set status = $1, error = $2
+               where queue_id = $3::uuid`,
+              [failed ? 'failed' : 'pending', msg, row.id]
+            )
           }
         }
       }
