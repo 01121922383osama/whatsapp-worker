@@ -2,7 +2,7 @@
   "name": "noor-whatsapp-worker",
   "private": true,
   "version": "1.0.0",
-  "description": "Long-running Baileys worker: read whatsapp_queue from Supabase and send messages.",
+  "description": "Long-running Baileys worker: read whatsapp_queue from Postgres and send messages.",
   "type": "module",
   "main": "index.js",
   "scripts": {
@@ -10,9 +10,10 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "dotenv": "^16.4.7",
-    "@supabase/supabase-js": "^2.49.0",
+    "@aws-sdk/client-s3": "^3.1045.0",
     "@whiskeysockets/baileys": "^6.7.8",
+    "dotenv": "^16.4.7",
+    "pg": "^8.16.3",
     "pino": "^9.6.0"
   }
 }
