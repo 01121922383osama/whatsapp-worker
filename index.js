@@ -25,6 +25,7 @@ for (const p of envPaths) {
 }
 
 import makeWASocket, {
+  Browsers,
   DisconnectReason,
   fetchLatestBaileysVersion,
   useMultiFileAuthState
@@ -69,6 +70,37 @@ const authRoot = authRootRaw
   ? resolve(authRootRaw)
   : resolve(__dirname, 'auth_info_baileys')
 
+/** WhatsApp often rejects Ubuntu/Linux fingerprints from cloud servers; default macOS Chrome. */
+const waWorkerBrowserEnv = (process.env.WA_WORKER_BROWSER || 'mac').trim().toLowerCase()
+
+function resolveWaSocketBrowser () {
+  if (waWorkerBrowserEnv === 'ubuntu' || waWorkerBrowserEnv === 'linux') {
+    return Browsers.ubuntu('Chrome')
+  }
+  if (waWorkerBrowserEnv === 'win' || waWorkerBrowserEnv === 'windows') {
+    return Browsers.windows('Chrome')
+  }
+  if (waWorkerBrowserEnv === 'appropriate') {
+    return Browsers.appropriate('Chrome')
+  }
+  return Browsers.macOS('Chrome')
+}
+
+const WA_SOCKET_BROWSER = resolveWaSocketBrowser()
+
+const _waConnectRaw = Number(process.env.WA_CONNECT_TIMEOUT_MS)
+const waConnectTimeoutMs =
+  Number.isFinite(_waConnectRaw) && _waConnectRaw >= 15_000
+    ? Math.min(_waConnectRaw, 120_000)
+    : 60_000
+
+/** IQ replies (init queries / fetchProps) — Baileys default 60s often times out on cloud→WA paths */
+const _waQtRaw = Number(process.env.WA_DEFAULT_QUERY_TIMEOUT_MS)
+const waDefaultQueryTimeoutMs =
+  Number.isFinite(_waQtRaw) && _waQtRaw >= 45_000
+    ? Math.min(_waQtRaw, 300_000)
+    : 120_000
+
 if (!databaseUrl) {
   console.error('Missing DATABASE_URL')
   process.exit(1)
@@ -90,7 +122,10 @@ logger.info(
     logLevel,
     dbHost: dbHostHint(),
     authRoot,
-    authRootFromEnv: Boolean(authRootRaw)
+    authRootFromEnv: Boolean(authRootRaw),
+    waBrowser: WA_SOCKET_BROWSER,
+    waConnectTimeoutMs,
+    waDefaultQueryTimeoutMs
   },
   '[wa-worker] starting'
 )
@@ -472,7 +507,12 @@ async function startSocket (tenantId, ctx) {
     logger: pino({
       level: logDebug ? 'debug' : 'error'
     }),
-    auth: state
+    auth: state,
+    browser: WA_SOCKET_BROWSER,
+    connectTimeoutMs: waConnectTimeoutMs,
+    defaultQueryTimeoutMs: waDefaultQueryTimeoutMs,
+    markOnlineOnConnect: false,
+    syncFullHistory: false
   }
   if (Array.isArray(version)) {
     sockOptions.version = version
@@ -1122,6 +1162,17 @@ async function cleanupAfterQueuedMediaSend (row, media) {
           { queueId: row.id, tenantId: row.tenant_id, path: media.path, bucket: media.bucket, status: res.status },
           '[wa-worker] storage delete failed (continuing)'
         )
+      } else {
+        logger.info(
+          {
+            queueId: row.id,
+            tenantId: row.tenant_id,
+            path: media.path,
+            bucket: media.bucket,
+            status: res.status
+          },
+          '[wa-worker] storage delete OK (after WhatsApp send)'
+        )
       }
     } catch (err) {
       logger.warn(
@@ -1145,6 +1196,11 @@ async function cleanupAfterQueuedMediaSend (row, media) {
         logger.warn(
           { queueId: row.id, path: media.path, bucket: media.bucket },
           `[wa-worker] storage delete skipped ${hint}`
+        )
+      } else {
+        logger.info(
+          { queueId: row.id, path: media.path, bucket: media.bucket },
+          '[wa-worker] S3 storage delete OK (after WhatsApp send)'
         )
       }
     } catch (s3Err) {

@@ -13,12 +13,24 @@ From the **repo root** `.env.local` (loaded automatically on `npm start`):
 - `R2_ASSIGNMENTS_PUBLIC_BASE_URL` — public read base (same as the web app)
 - `R2_ASSIGNMENTS_DELETE_BASE_URL` or `R2_ASSIGNMENTS_PUT_BASE_URL` — base used for `DELETE` after a successful send (R2/S3-compatible)
 
+**Session homework media (optional):** after **completing a session**, homework attachments queued for WhatsApp use the same pattern. The worker deletes the object from storage **only after** the media send succeeds, then removes the attachment from `sessions.session_report.homework_attachments`.
+
+- `R2_SESSION_HOMEWORK_PUBLIC_BASE_URL` — public read base (same as the web app)
+- `R2_SESSION_HOMEWORK_DELETE_BASE_URL` or `R2_SESSION_HOMEWORK_PUT_BASE_URL` — base for `DELETE` after send (or `R2_ASSIGNMENT_FEEDBACK_DELETE_BASE_URL` as a fallback, matching worker code)
+
+If neither HTTP delete base nor S3 env vars are set on the worker, logs show `storage delete skipped` and files remain in the bucket (WhatsApp delivery still proceeds).
+
 Optional:
 
 - `WORKER_POLL_MS` — poll interval ms, default `8000`
 - `WORKER_SESSION_POLL_MS` — how often to read `whatsapp_sessions`, default `5000`
 - `WA_WORKER_LOG_LEVEL` — `info` (default), `debug`, or `warn`
 - `WA_AUTH_ROOT` — absolute/relative path for Baileys auth files (recommended for persistent volume), default `services/whatsapp-worker/auth_info_baileys`
+- `WA_WORKER_BROWSER` — Baileys client fingerprint for QR pairing: `mac` (default, **recommended on Railway/Docker**), `windows`, `ubuntu`, `linux`, or `appropriate` (maps to host OS — usually still Linux in containers)
+- `WA_CONNECT_TIMEOUT_MS` — WebSocket connect timeout, default `60000` (min `15000`, max `120000`)
+- `WA_DEFAULT_QUERY_TIMEOUT_MS` — timeout for WA **IQ / init queries** (`fetchProps`, etc.), default `120000` (min `45000`, max `300000`). Raise if logs show `init queries` / `Timed Out` (408) right after connect.
+
+If the phone shows **“Couldn’t link device”** while the worker logs look healthy, try: default `WA_WORKER_BROWSER=mac`, ensure **only one** worker replica, unlink other **Linked devices** on the same WhatsApp account if you hit the device limit, then use **Cancel linking** in admin and start again with **Remove the old device link first** checked once to clear `WA_AUTH_ROOT/<tenant_id>/`.
 
 ### Debugging logs
 
