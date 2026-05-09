@@ -1154,15 +1154,14 @@ async function tryDeleteObjectViaS3 (objectKey) {
 async function cleanupAfterQueuedMediaSend (row, media) {
   const delBase = queuedMediaDeleteBaseUrl(media.bucket)
   const relPath = String(media.path ?? '').replace(/^\//, '')
+  /** R2/S3 often rejects unsigned HTTP DELETE on the PUT URL — fall back to S3 API when configured. */
+  let storageRemoved = false
+
   if (delBase) {
     try {
       const res = await fetch(`${delBase}/${relPath}`, { method: 'DELETE' })
-      if (!res.ok && res.status !== 404) {
-        logger.warn(
-          { queueId: row.id, tenantId: row.tenant_id, path: media.path, bucket: media.bucket, status: res.status },
-          '[wa-worker] storage delete failed (continuing)'
-        )
-      } else {
+      if (res.ok || res.status === 404) {
+        storageRemoved = true
         logger.info(
           {
             queueId: row.id,
@@ -1173,6 +1172,17 @@ async function cleanupAfterQueuedMediaSend (row, media) {
           },
           '[wa-worker] storage delete OK (after WhatsApp send)'
         )
+      } else {
+        logger.warn(
+          {
+            queueId: row.id,
+            tenantId: row.tenant_id,
+            path: media.path,
+            bucket: media.bucket,
+            status: res.status
+          },
+          '[wa-worker] HTTP storage delete not OK — trying S3 DeleteObject if configured'
+        )
       }
     } catch (err) {
       logger.warn(
@@ -1182,22 +1192,16 @@ async function cleanupAfterQueuedMediaSend (row, media) {
           path: media.path,
           err: err instanceof Error ? err.message : String(err)
         },
-        '[wa-worker] storage delete failed (continuing)'
+        '[wa-worker] HTTP storage delete failed — trying S3 DeleteObject if configured'
       )
     }
-  } else {
+  }
+
+  if (!storageRemoved) {
     try {
       const didS3 = await tryDeleteObjectViaS3(relPath)
-      if (!didS3) {
-        const hint =
-          media.bucket === 'session_homework'
-            ? '(set R2 delete/put base or S3_* on this worker)'
-            : '(set R2_ASSIGNMENTS_DELETE_BASE_URL or R2_ASSIGNMENTS_PUT_BASE_URL, or S3_* on this worker)'
-        logger.warn(
-          { queueId: row.id, path: media.path, bucket: media.bucket },
-          `[wa-worker] storage delete skipped ${hint}`
-        )
-      } else {
+      if (didS3) {
+        storageRemoved = true
         logger.info(
           { queueId: row.id, path: media.path, bucket: media.bucket },
           '[wa-worker] S3 storage delete OK (after WhatsApp send)'
@@ -1213,6 +1217,17 @@ async function cleanupAfterQueuedMediaSend (row, media) {
         '[wa-worker] S3 storage delete failed (continuing)'
       )
     }
+  }
+
+  if (!storageRemoved) {
+    const hint =
+      media.bucket === 'session_homework'
+        ? '(set a working R2 DELETE URL or S3_* on this worker)'
+        : '(set R2_ASSIGNMENTS_DELETE_BASE_URL or S3_* on this worker — unsigned DELETE on PUT URL often fails on R2)'
+    logger.warn(
+      { queueId: row.id, path: media.path, bucket: media.bucket },
+      `[wa-worker] storage delete skipped ${hint}`
+    )
   }
 
   if (media.bucket === 'assignments') {
