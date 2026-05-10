@@ -1429,7 +1429,12 @@ async function skipClassReminderIfSessionNotSendable (row) {
       return true
     }
     const low = String(r0.status ?? '').toLowerCase()
-    if (low === 'completed' || low === 'no_show' || low.startsWith('cancel')) {
+    if (
+      low === 'completed' ||
+      low === 'no_show' ||
+      low === 'rescheduled' ||
+      low.startsWith('cancel')
+    ) {
       const sentAt = new Date().toISOString()
       const errCode = 'skipped_session_not_active'
       await pool.query(
@@ -1451,7 +1456,7 @@ async function skipClassReminderIfSessionNotSendable (row) {
           messageType,
           sessionStatus: r0.status
         },
-        '[wa-worker] skipped class reminder — session cancelled or finished'
+        '[wa-worker] skipped class reminder — session not eligible (cancelled, rescheduled, or finished)'
       )
       return true
     }
