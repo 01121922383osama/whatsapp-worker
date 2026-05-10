@@ -51,6 +51,10 @@ npm install
 npm start
 ```
 
+## Deploys and `SIGTERM`
+
+Containers and PaaS send **`SIGTERM`** when they stop the process: new deploy, scaling, restarts, or host maintenance. **`npm error signal SIGTERM`** is npm reporting that the child exited after a normal platform stop — it is **not** an application bug. The worker now logs **`[wa-worker] shutdown signal`** and closes the Postgres pool before exit when possible.
+
 ## Behaviour
 
 1. Claims `whatsapp_queue` rows with **`FOR UPDATE SKIP LOCKED`**: eligible rows must have **`status = 'pending'`** and `scheduled_at <= now()`.

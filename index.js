@@ -172,6 +172,12 @@ const NOT_LINKED_LOG_INTERVAL_MS = 5 * 60 * 1000
 
 let queuePollTicks = 0
 
+/** Set on SIGTERM/SIGINT so the queue loop exits and the pool can close cleanly. */
+let workerShuttingDown = false
+
+/** @type {ReturnType<typeof setInterval> | null} */
+let sessionPollTimer = null
+
 /** @type {Map<string, string>} last pairing_requested_at (ISO string) we started handling */
 const pairingHandled = new Map()
 
@@ -1942,7 +1948,7 @@ async function processClaimedQueueRow (row) {
 }
 
 async function pollLoop () {
-  for (;;) {
+  while (!workerShuttingDown) {
     try {
       queuePollTicks += 1
       await recoverStaleProcessingRows()
@@ -1963,6 +1969,7 @@ async function pollLoop () {
           logger.debug({ count: rows.length, workerId: WORKER_INSTANCE_ID }, '[wa-worker] claimed rows')
         }
         for (const row of rows) {
+          if (workerShuttingDown) break
           await processClaimedQueueRow(row)
         }
       }
@@ -1972,16 +1979,45 @@ async function pollLoop () {
         '[wa-worker] poll loop error'
       )
     }
+    if (workerShuttingDown) break
     await new Promise((r) => setTimeout(r, pollMs))
   }
+  logger.info('[wa-worker] queue poll loop stopped')
 }
 
-setInterval(() => {
+function onShutdownSignal (signal) {
+  if (workerShuttingDown) return
+  workerShuttingDown = true
+  if (sessionPollTimer != null) {
+    clearInterval(sessionPollTimer)
+    sessionPollTimer = null
+  }
+  logger.warn(
+    { signal },
+    '[wa-worker] shutdown signal — platform stop, deploy, or manual kill (SIGTERM is normal); finishing current work then exiting'
+  )
+}
+
+process.once('SIGTERM', () => onShutdownSignal('SIGTERM'))
+process.once('SIGINT', () => onShutdownSignal('SIGINT'))
+
+sessionPollTimer = setInterval(() => {
   void pollSessions()
 }, sessionPollMs)
 void pollSessions()
 
-pollLoop().catch((e) => {
-  logger.fatal({ err: e instanceof Error ? e.message : String(e) }, '[wa-worker] fatal')
-  process.exit(1)
-})
+pollLoop()
+  .then(async () => {
+    logger.info('[wa-worker] closing pg pool')
+    await pool.end().catch((err) => {
+      logger.warn(
+        { err: err instanceof Error ? err.message : String(err) },
+        '[wa-worker] pool.end failed (ignored)'
+      )
+    })
+    process.exit(0)
+  })
+  .catch((e) => {
+    logger.fatal({ err: e instanceof Error ? e.message : String(e) }, '[wa-worker] fatal')
+    process.exit(1)
+  })
