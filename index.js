@@ -11,6 +11,7 @@ import { existsSync } from 'fs'
 import { rm } from 'fs/promises'
 import { dirname, resolve } from 'path'
 import { fileURLToPath } from 'url'
+import { randomUUID } from 'crypto'
 import pg from 'pg'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
@@ -101,6 +102,36 @@ const waDefaultQueryTimeoutMs =
     ? Math.min(_waQtRaw, 300_000)
     : 120_000
 
+const WORKER_INSTANCE_ID =
+  (process.env.WA_WORKER_INSTANCE_ID || '').trim() || `wa:${randomUUID()}`
+
+const _processingTimeoutRaw = Number(process.env.WA_QUEUE_PROCESSING_TIMEOUT_MS)
+const QUEUE_PROCESSING_TIMEOUT_MS =
+  Number.isFinite(_processingTimeoutRaw) && _processingTimeoutRaw >= 30_000
+    ? Math.min(_processingTimeoutRaw, 3_600_000)
+    : 120_000
+
+const queueBatchSize = Math.min(
+  75,
+  Math.max(1, Number(process.env.WA_QUEUE_BATCH_SIZE) || 5)
+)
+
+const RETRY_BASE_MS = Math.max(5000, Number(process.env.WA_QUEUE_RETRY_BASE_MS) || 15_000)
+const RETRY_MAX_MS = Math.max(RETRY_BASE_MS, Number(process.env.WA_QUEUE_RETRY_MAX_MS) || 1_800_000)
+const RETRY_JITTER_MS = Math.max(0, Number(process.env.WA_QUEUE_RETRY_JITTER_MS) || 4000)
+
+const STALE_RECOVERY_CAP = Math.max(
+  1,
+  Math.min(50, Number(process.env.WA_QUEUE_MAX_STALE_RECOVERIES_PER_ROW) || 8)
+)
+
+const CLEANUP_SENT_SKIPPED_DAYS = Math.max(7, Number(process.env.WA_QUEUE_CLEANUP_SENT_SKIPPED_DAYS) || 90)
+const CLEANUP_FAILED_DAYS = Math.max(14, Number(process.env.WA_QUEUE_CLEANUP_FAILED_DAYS) || 180)
+const CLEANUP_BATCH = Math.max(20, Math.min(2000, Number(process.env.WA_QUEUE_CLEANUP_BATCH) || 200))
+const CLEANUP_EVERY_N_POLLS = Math.max(1, Number(process.env.WA_QUEUE_CLEANUP_EVERY_N_POLLS) || 25)
+
+const DAY_MS = 86_400_000
+
 if (!databaseUrl) {
   console.error('Missing DATABASE_URL')
   process.exit(1)
@@ -125,12 +156,21 @@ logger.info(
     authRootFromEnv: Boolean(authRootRaw),
     waBrowser: WA_SOCKET_BROWSER,
     waConnectTimeoutMs,
-    waDefaultQueryTimeoutMs
+    waDefaultQueryTimeoutMs,
+    workerInstanceId: WORKER_INSTANCE_ID,
+    queueBatchSize,
+    queueProcessingTimeoutMs: QUEUE_PROCESSING_TIMEOUT_MS
   },
   '[wa-worker] starting'
 )
 
 const SESSION_LABEL = 'default'
+
+/** @type {Map<string, number>} */
+const notLinkedLastLogged = new Map()
+const NOT_LINKED_LOG_INTERVAL_MS = 5 * 60 * 1000
+
+let queuePollTicks = 0
 
 /** @type {Map<string, string>} last pairing_requested_at (ISO string) we started handling */
 const pairingHandled = new Map()
@@ -231,6 +271,286 @@ function invalidateGroupsCache (tenantId) {
   tenantGroupsCache.delete(tenantId)
 }
 
+function computeRetryDelayMs (retryCountAfterIncrement, idSeed) {
+  const rc = Math.max(1, Math.floor(Number(retryCountAfterIncrement)))
+  const exp = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * (2 ** Math.min(rc - 1, 12)))
+  let h = 0
+  const seed = String(idSeed ?? '')
+  for (let i = 0; i < seed.length; i++) {
+    h = Math.imul(31, h) + seed.charCodeAt(i)
+    h |= 0
+  }
+  const jitter = RETRY_JITTER_MS <= 0 ? 0 : Math.abs(h) % (RETRY_JITTER_MS + 1)
+  return Math.min(RETRY_MAX_MS, exp + jitter)
+}
+
+async function finalizeQueueSkipped (queueRow, errCode, logFields = {}) {
+  const qr = await pool.query(
+    `update public.whatsapp_queue
+     set status = 'skipped',
+         sent_at = coalesce(sent_at, now()),
+         error = $1,
+         processing_started_at = null,
+         processing_owner = null
+     where id = $2::uuid
+       and processing_owner = $3
+       and status = 'processing'
+     returning id`,
+    [errCode, queueRow.id, WORKER_INSTANCE_ID]
+  )
+  if (!(qr.rowCount > 0)) {
+    logger.warn(
+      { queueId: queueRow.id, errCode },
+      '[wa-worker] finalize skipped skipped — row not owned / already finalized'
+    )
+    return
+  }
+  await pool.query(
+    `update public.whatsapp_messages_log
+     set status = 'skipped',
+         error = $1
+     where queue_id = $2::uuid`,
+    [errCode, queueRow.id]
+  )
+  logger.info({ queueId: queueRow.id, errCode, ...logFields }, '[wa-worker] queue row skipped')
+}
+
+async function releaseNotLinkedDefer (queueRow) {
+  const deferMs =
+    60_000 +
+    ((String(queueRow.id).charCodeAt(0) || 0) % 45) * 1000
+  const deferredUntil = new Date(Date.now() + deferMs).toISOString()
+  const notLinkedErr = 'whatsapp_not_linked'
+  const ur = await pool.query(
+    `update public.whatsapp_queue
+     set scheduled_at = $1::timestamptz,
+         status = 'pending',
+         error = coalesce(error, $2),
+         processing_started_at = null,
+         processing_owner = null,
+         last_attempt_at = now()
+     where id = $3::uuid
+       and processing_owner = $4
+       and status = 'processing'`,
+    [deferredUntil, notLinkedErr, queueRow.id, WORKER_INSTANCE_ID]
+  )
+  if (!(ur.rowCount > 0)) return
+  await pool.query(
+    `update public.whatsapp_messages_log
+     set error = $1
+     where queue_id = $2::uuid and error is null`,
+    [notLinkedErr, queueRow.id]
+  )
+  const now = Date.now()
+  const last = notLinkedLastLogged.get(queueRow.tenant_id) ?? 0
+  if (now - last > NOT_LINKED_LOG_INTERVAL_MS) {
+    notLinkedLastLogged.set(queueRow.tenant_id, now)
+    logger.warn(
+      { tenantId: queueRow.tenant_id },
+      '[wa-worker] deferring queued rows — tenant not linked'
+    )
+  }
+}
+
+async function recoverStaleProcessingRows () {
+  const staleSec = Math.max(30, Math.floor(QUEUE_PROCESSING_TIMEOUT_MS / 1000))
+  const client = await pool.connect()
+  try {
+    await client.query('begin')
+    const stale = await client.query(
+      `select id,
+              tenant_id,
+              processing_recovery_count,
+              processing_owner
+       from public.whatsapp_queue
+       where status = 'processing'
+         and processing_started_at < now () - $1::interval
+       order by processing_started_at asc, id asc
+       limit 100
+       for update skip locked`,
+      [`${staleSec} seconds`]
+    )
+    for (const row of stale.rows) {
+      const recoveries =
+        Math.min(999, (Number(row.processing_recovery_count) || 0) + 1)
+      if (recoveries > STALE_RECOVERY_CAP) {
+        await client.query(
+          `update public.whatsapp_queue
+           set status = 'failed',
+               error = 'stale_processing_gave_up',
+               processing_started_at = null,
+               processing_owner = null,
+               last_attempt_at = now (),
+               processing_recovery_count = $2
+           where id = $1::uuid`,
+          [row.id, recoveries]
+        )
+        await client.query(
+          `update public.whatsapp_messages_log
+           set status = 'failed',
+               error = 'stale_processing_gave_up'
+           where queue_id = $1::uuid`,
+          [row.id]
+        )
+        logger.error(
+          {
+            queueId: row.id,
+            tenantId: row.tenant_id,
+            staleRecoveries: recoveries,
+            staleOwner: row.processing_owner
+          },
+          '[wa-worker] stale processing exceeded recovery cap — failed'
+        )
+      } else {
+        const delay = computeRetryDelayMs(recoveries, String(row.id))
+        const nextAt = new Date(Date.now() + delay).toISOString()
+        const note =
+          'stale_processing_recovered:' +
+          `owner=${((row.processing_owner ?? '') + '').trim() || '?'}:${recoveries}`
+        await client.query(
+          `update public.whatsapp_queue
+           set status = 'pending',
+               scheduled_at = $2::timestamptz,
+               processing_started_at = null,
+               processing_owner = null,
+               processing_recovery_count = $3,
+               error = coalesce (error, $4),
+               last_attempt_at = now ()
+           where id = $1::uuid`,
+          [row.id, nextAt, recoveries, note]
+        )
+        logger.warn(
+          {
+            queueId: row.id,
+            tenantId: row.tenant_id,
+            staleRecoveries: recoveries,
+            staleOwner: row.processing_owner,
+            nextScheduledAt: nextAt
+          },
+          '[wa-worker] stale processing recovered → pending'
+        )
+      }
+    }
+    await client.query('commit')
+  } catch (err) {
+    try {
+      await client.query('rollback')
+    } catch (_) {}
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      '[wa-worker] stale recovery txn failed'
+    )
+  } finally {
+    client.release()
+  }
+}
+
+async function cleanupOldTerminalRowsBatch () {
+  const sentCut =
+    Date.now () - CLEANUP_SENT_SKIPPED_DAYS * DAY_MS
+  const failCut =
+    Date.now () - CLEANUP_FAILED_DAYS * DAY_MS
+  try {
+    const r1 = await pool.query(
+      `with doomed as (
+         select id
+         from public.whatsapp_queue
+         where status in ('sent', 'skipped')
+           and coalesce(sent_at, created_at, now ()) < ($1::timestamptz)
+         order by coalesce(sent_at, created_at), id
+         limit $2
+       ),
+       dl as (
+         delete from public.whatsapp_messages_log m
+         using doomed d
+         where m.queue_id = d.id
+         returning m.queue_id
+       )
+       delete from public.whatsapp_queue q
+       using doomed d
+       where q.id = d.id`,
+      [new Date(sentCut).toISOString(), CLEANUP_BATCH]
+    )
+    const n1 = r1.rowCount ?? 0
+    if (n1 > 0) {
+      logger.info(
+        {
+          deleted: n1,
+          cutoff: new Date(sentCut).toISOString(),
+          kind: 'sent_skipped_batch'
+        },
+        '[wa-worker] cleanup old terminal rows'
+      )
+    }
+    const r2 = await pool.query(
+      `with doomed as (
+         select id
+         from public.whatsapp_queue
+         where status = 'failed'
+           and created_at < ($1::timestamptz)
+         order by created_at, id
+         limit $2
+       ),
+       dl as (
+         delete from public.whatsapp_messages_log m
+         using doomed d
+         where m.queue_id = d.id
+       )
+       delete from public.whatsapp_queue q
+       using doomed d
+       where q.id = d.id`,
+      [new Date(failCut).toISOString(), CLEANUP_BATCH]
+    )
+    const n2 = r2.rowCount ?? 0
+    if (n2 > 0) {
+      logger.info(
+        {
+          deleted: n2,
+          cutoff: new Date(failCut).toISOString(),
+          kind: 'failed_batch'
+        },
+        '[wa-worker] cleanup old terminal rows'
+      )
+    }
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      '[wa-worker] cleanup batch failed'
+    )
+  }
+}
+
+async function claimNextQueueRows () {
+  const res = await pool.query(
+    `with cte as (
+       select id
+       from public.whatsapp_queue
+       where status = 'pending'
+         and scheduled_at <= now ()
+       order by scheduled_at asc, id asc
+       limit $1
+       for update skip locked
+     )
+     update public.whatsapp_queue q
+     set status = 'processing',
+         processing_started_at = now (),
+         processing_owner = $2,
+         last_attempt_at = now ()
+     from cte
+     where q.id = cte.id
+     returning q.id,
+               q.tenant_id,
+               q.recipient_phone,
+               q.message_type,
+               q.recipient_type,
+               q.message_body,
+               q.retry_count,
+               q.session_id`,
+    [queueBatchSize, WORKER_INSTANCE_ID]
+  )
+  return res.rows
+}
+
 /** Errors that will never resolve by retrying the same row — fail immediately. */
 function isPermanentSendError (msg) {
   if (!msg) return false
@@ -238,6 +558,12 @@ function isPermanentSendError (msg) {
   if (m.startsWith('group_not_found')) return true
   if (m === 'empty_phone' || m === 'invalid_phone' || m === 'empty_group_name') return true
   if (m.includes('bad_session_repair_required')) return true
+  if (m.includes('invalid_media_payload')) return true
+  if (m.includes('media_path_tenant_mismatch')) return true
+  if (m.includes('media_session_mismatch')) return true
+  if (m.includes('media_tenant_mismatch')) return true
+  if (m.startsWith('media_download_failed')) return true
+  if (m.includes('stale_processing_gave_up')) return true
   return false
 }
 
@@ -816,9 +1142,7 @@ async function pollSessions () {
   }
 }
 
-/** @type {Map<string, number>} */
-const notLinkedLastLogged = new Map()
-const NOT_LINKED_LOG_INTERVAL_MS = 5 * 60 * 1000
+
 
 async function getSockForSend (tenantId) {
   if (!hasPersistedCreds(tenantId)) {
@@ -900,20 +1224,9 @@ async function resolveRecipientJid (tenantId, sock, recipientRaw) {
   return { jid, resolution: 'phone_digits', meta: { digits } }
 }
 
-const LATE_START_MESSAGE_TYPES = new Set(['class_reminder_late', 'class_reminder_teacher_late'])
 const CLASS_REMINDER_MESSAGE_TYPES = new Set(['class_reminder', 'class_reminder_teacher'])
 const ASSIGNMENT_MEDIA_MESSAGE_TYPE = 'assignment_created_parent_media'
 const SESSION_HOMEWORK_MEDIA_MESSAGE_TYPE = 'session_attendance_homework_media'
-
-function looksLikeLateStartReminder (row) {
-  const messageType = row.message_type ?? ''
-  if (LATE_START_MESSAGE_TYPES.has(messageType)) return true
-  const body = String(row.message_body ?? '').toLowerCase()
-  return body.includes('تنبيه تأخر') ||
-    body.includes('تأخر بدء الحصة') ||
-    body.includes('late class start') ||
-    body.includes('late start')
-}
 
 function looksLikeQueuedMediaPayload (rawBody) {
   const s = String(rawBody ?? '').trim()
@@ -1308,25 +1621,6 @@ async function cleanupAssignmentsAttachmentsDbAfterSend (row, media) {
 }
 
 /**
- * Late-start messages are not sent; drop queue + log rows so backlog does not
- * accumulate bodies or failed rows in the DB / admin UI.
- * @returns {Promise<boolean>} true if row was removed (caller must not send)
- */
-async function abandonStaleLateReminderIfNeeded (row) {
-  if (!looksLikeLateStartReminder(row)) return false
-  logger.info(
-    { queueId: row.id, messageType: row.message_type ?? '', sessionId: row.session_id },
-    '[wa-worker] deleting disabled late-start reminder row'
-  )
-  await pool.query(
-    'delete from public.whatsapp_messages_log where queue_id = $1::uuid',
-    [row.id]
-  )
-  await pool.query('delete from public.whatsapp_queue where id = $1::uuid', [row.id])
-  return true
-}
-
-/**
  * Session-scoped WhatsApp: do not deliver if student, teacher, or linked family is operationally inactive.
  * Terminates queue row without network send or retries.
  */
@@ -1358,29 +1652,12 @@ async function skipOperationalInactiveQueueRow (row) {
     const hasFam = famRaw != null && String(famRaw).trim() !== ''
     const inactiveFam = hasFam && String(famRaw).trim().toLowerCase() === 'inactive'
     if (!inactiveStu && !inactiveTea && !inactiveFam) return false
-    const sentAt = new Date().toISOString()
-    await pool.query(
-      `update public.whatsapp_queue
-       set status = 'sent', sent_at = $1::timestamptz, error = 'skipped_inactive_entity'
-       where id = $2::uuid`,
-      [sentAt, row.id]
-    )
-    await pool.query(
-      `update public.whatsapp_messages_log
-       set error = 'skipped_inactive_entity'
-       where queue_id = $1::uuid and error is null`,
-      [row.id]
-    )
-    logger.info(
-      {
-        queueId: row.id,
-        sessionId,
-        inactiveStu,
-        inactiveTea,
-        inactiveFam
-      },
-      '[wa-worker] skipped send — operational inactive entity'
-    )
+    await finalizeQueueSkipped(row, 'skipped_inactive_entity', {
+      sessionId,
+      inactiveStu,
+      inactiveTea,
+      inactiveFam
+    })
     return true
   } catch (err) {
     logger.warn(
@@ -1408,24 +1685,11 @@ async function skipClassReminderIfSessionNotSendable (row) {
     )
     const r0 = q.rows[0]
     if (!r0) {
-      const sentAt = new Date().toISOString()
       const errCode = 'skipped_missing_session'
-      await pool.query(
-        `update public.whatsapp_queue
-         set status = 'sent', sent_at = $1::timestamptz, error = $2
-         where id = $3::uuid`,
-        [sentAt, errCode, row.id]
-      )
-      await pool.query(
-        `update public.whatsapp_messages_log
-         set error = $1
-         where queue_id = $2::uuid and error is null`,
-        [errCode, row.id]
-      )
-      logger.info(
-        { queueId: row.id, sessionId, messageType },
-        '[wa-worker] skipped class reminder — session no longer exists'
-      )
+      await finalizeQueueSkipped(row, errCode, {
+        sessionId,
+        messageType
+      })
       return true
     }
     const low = String(r0.status ?? '').toLowerCase()
@@ -1435,29 +1699,12 @@ async function skipClassReminderIfSessionNotSendable (row) {
       low === 'rescheduled' ||
       low.startsWith('cancel')
     ) {
-      const sentAt = new Date().toISOString()
       const errCode = 'skipped_session_not_active'
-      await pool.query(
-        `update public.whatsapp_queue
-         set status = 'sent', sent_at = $1::timestamptz, error = $2
-         where id = $3::uuid`,
-        [sentAt, errCode, row.id]
-      )
-      await pool.query(
-        `update public.whatsapp_messages_log
-         set error = $1
-         where queue_id = $2::uuid and error is null`,
-        [errCode, row.id]
-      )
-      logger.info(
-        {
-          queueId: row.id,
-          sessionId,
-          messageType,
-          sessionStatus: r0.status
-        },
-        '[wa-worker] skipped class reminder — session not eligible (cancelled, rescheduled, or finished)'
-      )
+      await finalizeQueueSkipped(row, errCode, {
+        sessionId,
+        messageType,
+        sessionStatus: r0.status
+      })
       return true
     }
     return false
@@ -1535,171 +1782,188 @@ async function sendOnce (row) {
   logger.info({ queueId, jid, messageType, resolution }, '[wa-worker] sendMessage OK')
 }
 
+async function processClaimedQueueRow (row) {
+  try {
+    const skippedInactive = await skipOperationalInactiveQueueRow(row)
+    if (skippedInactive) return
+    const skippedClassReminder = await skipClassReminderIfSessionNotSendable(row)
+    if (skippedClassReminder) return
+    if (!hasPersistedCreds(row.tenant_id)) {
+      await releaseNotLinkedDefer(row)
+      return
+    }
+    await sendOnce(row)
+    resetSessionFailures(row.tenant_id)
+    const sentAt = new Date().toISOString()
+    const fin = await pool.query(
+      `update public.whatsapp_queue
+       set status = 'sent',
+           sent_at = $1::timestamptz,
+           error = null,
+           processing_started_at = null,
+           processing_owner = null,
+           processing_recovery_count = 0,
+           last_attempt_at = now()
+       where id = $2::uuid
+         and processing_owner = $3
+         and status = 'processing'`,
+      [sentAt, row.id, WORKER_INSTANCE_ID]
+    )
+    if (!(fin.rowCount > 0)) {
+      logger.warn(
+        { queueId: row.id },
+        '[wa-worker] sent OK but finalize lost race — another worker may have updated row'
+      )
+      return
+    }
+    await pool.query(
+      `update public.whatsapp_messages_log
+       set status = 'sent',
+           error = null
+       where queue_id = $1::uuid`,
+      [row.id]
+    )
+    logger.info({ queueId: row.id }, '[wa-worker] DB updated: sent')
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    if (msg.includes('whatsapp_not_linked')) {
+      await updateSession(row.tenant_id, {
+        status: 'disconnected',
+        last_error: msg.slice(0, 500),
+        worker_checked_at: new Date().toISOString()
+      })
+      await releaseNotLinkedDefer(row)
+      return
+    }
+    const connDead = shouldResetSocketAfterSendError(e)
+    const msgLower = msg.toLowerCase()
+    const badSessionSendError =
+      msgLower.includes('badsession') ||
+      msgLower.includes('bad session') ||
+      msgLower.includes('bad mac') ||
+      msgLower.includes('failed to decrypt') ||
+      msgLower.includes('no matching sessions') ||
+      msgLower.includes('sessionerror') ||
+      msgLower.includes('verifymac')
+    if (msgLower.startsWith('group_not_found')) {
+      invalidateGroupsCache(row.tenant_id)
+    }
+    let wiped = false
+    if (badSessionSendError) {
+      const tracker = recordSessionFailure(row.tenant_id)
+      if (shouldWipeAuth(row.tenant_id)) {
+        await wipeTenantAuth(row.tenant_id, `send:${msg.slice(0, 120)}`)
+        wiped = true
+      } else {
+        logger.warn(
+          {
+            tenantId: row.tenant_id,
+            queueId: row.id,
+            err: msg.slice(0, 200),
+            failureCount: tracker.count,
+            threshold: BAD_SESSION_THRESHOLD
+          },
+          '[wa-worker] transient send-side session error — keeping auth, will retry'
+        )
+      }
+    }
+    if (connDead) {
+      await resetTenantSendSocket(row.tenant_id, msg)
+    }
+    const rc = (row.retry_count ?? 0) + 1
+    const permanent = isPermanentSendError(msg) || wiped
+    const failed = permanent || (connDead ? rc >= 12 : rc >= 5)
+    const nextSched = failed
+      ? null
+      : new Date(Date.now() + computeRetryDelayMs(rc, String(row.id))).toISOString()
+    logger.error(
+      {
+        queueId: row.id,
+        messageType: row.message_type,
+        recipientRaw: row.recipient_phone,
+        err: msg,
+        retryCount: rc,
+        willFailPermanently: failed,
+        permanent,
+        wiped,
+        nextScheduledAt: nextSched
+      },
+      '[wa-worker] send failed'
+    )
+    if (failed) {
+      const uq = await pool.query(
+        `update public.whatsapp_queue
+         set status = 'failed',
+             error = $1,
+             retry_count = $2,
+             processing_started_at = null,
+             processing_owner = null,
+             last_attempt_at = now()
+         where id = $3::uuid
+           and processing_owner = $4
+           and status = 'processing'`,
+        [msg, rc, row.id, WORKER_INSTANCE_ID]
+      )
+      if (uq.rowCount > 0) {
+        await pool.query(
+          `update public.whatsapp_messages_log
+           set status = 'failed',
+               error = $1
+           where queue_id = $2::uuid`,
+          [msg, row.id]
+        )
+      }
+    } else {
+      const uq = await pool.query(
+        `update public.whatsapp_queue
+         set status = 'pending',
+             error = $1,
+             retry_count = $2,
+             scheduled_at = $3::timestamptz,
+             processing_started_at = null,
+             processing_owner = null,
+             last_attempt_at = now()
+         where id = $4::uuid
+           and processing_owner = $5
+           and status = 'processing'`,
+        [msg, rc, nextSched, row.id, WORKER_INSTANCE_ID]
+      )
+      if (uq.rowCount > 0) {
+        await pool.query(
+          `update public.whatsapp_messages_log
+           set status = 'pending',
+               error = $1
+           where queue_id = $2::uuid`,
+          [msg, row.id]
+        )
+      }
+    }
+  }
+}
+
 async function pollLoop () {
   for (;;) {
     try {
+      queuePollTicks += 1
+      await recoverStaleProcessingRows()
+      if (queuePollTicks % CLEANUP_EVERY_N_POLLS === 0) {
+        await cleanupOldTerminalRowsBatch()
+      }
       let rows = []
       try {
-        const res = await pool.query(
-          `select id, tenant_id, recipient_phone, message_type, recipient_type, message_body, status, retry_count, session_id
-           from public.whatsapp_queue
-           where (status is null or status = 'pending')
-             and scheduled_at <= $1::timestamptz
-           order by scheduled_at asc, id asc
-           limit 5`,
-          [new Date().toISOString()]
-        )
-        rows = res.rows
+        rows = await claimNextQueueRows()
       } catch (error) {
         logger.error(
           { err: error instanceof Error ? error.message : String(error) },
-          '[wa-worker] poll query failed'
+          '[wa-worker] claim batch failed'
         )
       }
-
       if (rows?.length) {
         if (logDebug) {
-          logger.debug({ count: rows.length }, '[wa-worker] fetched pending rows')
+          logger.debug({ count: rows.length, workerId: WORKER_INSTANCE_ID }, '[wa-worker] claimed rows')
         }
         for (const row of rows) {
-          try {
-            const abandoned = await abandonStaleLateReminderIfNeeded(row)
-            if (abandoned) continue
-            const skippedInactive = await skipOperationalInactiveQueueRow(row)
-            if (skippedInactive) continue
-            const skippedClassReminder = await skipClassReminderIfSessionNotSendable(row)
-            if (skippedClassReminder) continue
-            /** Skip rows whose tenant is not linked (without burning a retry slot). */
-            if (!hasPersistedCreds(row.tenant_id)) {
-              /** Explain in DB/UI why pending rows never leave — without failing the row (sends after pairing). */
-              const notLinkedErr = 'whatsapp_not_linked'
-              const deferMs = 60_000 + (String(row.id).charCodeAt(0) % 45) * 1000
-              const deferredUntil = new Date(Date.now() + deferMs).toISOString()
-              /** Always bump schedule so one dead tenant cannot starve others in the same DB (FIFO poll). */
-              await pool.query(
-                `update public.whatsapp_queue set scheduled_at = $1::timestamptz where id = $2::uuid`,
-                [deferredUntil, row.id]
-              )
-              await pool.query(
-                `update public.whatsapp_queue set error = $1 where id = $2::uuid and error is null`,
-                [notLinkedErr, row.id]
-              )
-              await pool.query(
-                `update public.whatsapp_messages_log set error = $1 where queue_id = $2::uuid and error is null`,
-                [notLinkedErr, row.id]
-              )
-              const now = Date.now()
-              const last = notLinkedLastLogged.get(row.tenant_id) ?? 0
-              if (now - last > NOT_LINKED_LOG_INTERVAL_MS) {
-                notLinkedLastLogged.set(row.tenant_id, now)
-                logger.warn(
-                  { tenantId: row.tenant_id },
-                  '[wa-worker] skipping queued rows — tenant not linked (pair from admin settings)'
-                )
-              }
-              continue
-            }
-            await sendOnce(row)
-            resetSessionFailures(row.tenant_id)
-            const sentAt = new Date().toISOString()
-            await pool.query(
-              `update public.whatsapp_queue
-               set status = 'sent', sent_at = $1::timestamptz, error = null
-               where id = $2::uuid`,
-              [sentAt, row.id]
-            )
-            await pool.query(
-              `update public.whatsapp_messages_log set status = 'sent', error = null where queue_id = $1::uuid`,
-              [row.id]
-            )
-            logger.info({ queueId: row.id }, '[wa-worker] DB updated: sent')
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e)
-            const connDead = shouldResetSocketAfterSendError(e)
-            const msgLower = msg.toLowerCase()
-            const badSessionSendError =
-              msgLower.includes('badsession') ||
-              msgLower.includes('bad session') ||
-              msgLower.includes('bad mac') ||
-              msgLower.includes('failed to decrypt') ||
-              msgLower.includes('no matching sessions') ||
-              msgLower.includes('sessionerror') ||
-              msgLower.includes('verifymac')
-            if (msg.includes('whatsapp_not_linked')) {
-              await updateSession(row.tenant_id, {
-                status: 'disconnected',
-                last_error: msg.slice(0, 500),
-                worker_checked_at: new Date().toISOString()
-              })
-            }
-            if (msgLower.startsWith('group_not_found')) {
-              invalidateGroupsCache(row.tenant_id)
-            }
-            /**
-             * Used to wipe auth immediately on the first decrypt/Bad MAC/verifymac — but
-             * these are usually transient (often caused by the same WA number being used
-             * on WhatsApp Web/Desktop elsewhere while the worker is running). Count them
-             * in the rolling window; only wipe after the threshold so the admin doesn't
-             * lose pairing on every hiccup.
-             */
-            let wiped = false
-            if (badSessionSendError) {
-              const tracker = recordSessionFailure(row.tenant_id)
-              if (shouldWipeAuth(row.tenant_id)) {
-                await wipeTenantAuth(row.tenant_id, `send:${msg.slice(0, 120)}`)
-                wiped = true
-              } else {
-                logger.warn(
-                  {
-                    tenantId: row.tenant_id,
-                    queueId: row.id,
-                    err: msg.slice(0, 200),
-                    failureCount: tracker.count,
-                    threshold: BAD_SESSION_THRESHOLD
-                  },
-                  '[wa-worker] transient send-side session error — keeping auth, will retry'
-                )
-              }
-            }
-            if (connDead) {
-              await resetTenantSendSocket(row.tenant_id, msg)
-            }
-            const rc = (row.retry_count ?? 0) + 1
-            /**
-             * `badSessionSendError` used to force a permanent failure on the queue row.
-             * Now those are treated as transient (the message will go out once the socket
-             * reopens), so we only permanently fail if isPermanentSendError says so OR we
-             * actually wiped auth, OR retries are exhausted.
-             */
-            const permanent = isPermanentSendError(msg) || wiped
-            /** Transient WA disconnects — allow more retries than hard failures */
-            const failed = permanent || (connDead ? rc >= 12 : rc >= 5)
-            logger.error(
-              {
-                queueId: row.id,
-                messageType: row.message_type,
-                recipientRaw: row.recipient_phone,
-                err: msg,
-                retryCount: rc,
-                willFailPermanently: failed,
-                permanent,
-                wiped
-              },
-              '[wa-worker] send failed'
-            )
-            await pool.query(
-              `update public.whatsapp_queue
-               set status = $1, error = $2, retry_count = $3
-               where id = $4::uuid`,
-              [failed ? 'failed' : 'pending', msg, rc, row.id]
-            )
-            await pool.query(
-              `update public.whatsapp_messages_log
-               set status = $1, error = $2
-               where queue_id = $3::uuid`,
-              [failed ? 'failed' : 'pending', msg, row.id]
-            )
-          }
+          await processClaimedQueueRow(row)
         }
       }
     } catch (e) {

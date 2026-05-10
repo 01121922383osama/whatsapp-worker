@@ -53,14 +53,23 @@ npm start
 
 ## Behaviour
 
-1. Polls `whatsapp_queue` for rows with `status = 'pending'` (or null).
-2. Sends via WhatsApp Web (Baileys) using the **academy’s** session (`tenant_id` on each row). Auth files live under **`auth_info_baileys/<tenant_id>/`** (one WhatsApp account per tenant).
-3. Polls `whatsapp_sessions` (label `default`) for pairing / logout requests from the admin UI.
-4. On success, sets `status = 'sent'`, `sent_at = now()`. On failure, increments `retry_count` and stores `error`.
+1. Claims `whatsapp_queue` rows with **`FOR UPDATE SKIP LOCKED`**: eligible rows must have **`status = 'pending'`** and `scheduled_at <= now()`.
+2. After claim sets **`processing`**, **`processing_started_at`**, and **`processing_owner`** (defaults to a UUID based id; override with **`WA_WORKER_INSTANCE_ID`**).
+3. Sends via WhatsApp Web (Baileys) using the **academy’s** session (`tenant_id` on each row). Auth files live under **`auth_info_baileys/<tenant_id>/`** (one WhatsApp account per tenant).
+4. Polls `whatsapp_sessions` (label `default`) for pairing / logout requests from the admin UI.
+5. On success sets **`sent`**, `sent_at`, clears processing fields. Operational / class-reminder skips set **`skipped`** (no WhatsApp delivery). Retryable failures bump **`retry_count`**, reschedule with backoff + jitter, and reset to **`pending`**. Permanent failures (invalid phone/group, wiped auth, capped retries, etc.) set **`failed`**.
+6. **Stale recovery:** rows stuck in **`processing`** older than **`WA_QUEUE_PROCESSING_TIMEOUT_MS`** (default `120000` ms, min 30s) are moved back to **`pending`** with a delay, counting **`processing_recovery_count`**; exceeding **`WA_QUEUE_MAX_STALE_RECOVERIES_PER_ROW`** (default `8`) marks **`failed`** with `stale_processing_gave_up`.
+7. **Cleanup (batched):** every **`WA_QUEUE_CLEANUP_EVERY_N_POLLS`** poll ticks removes up to **`WA_QUEUE_CLEANUP_BATCH`** **`sent`** / **`skipped`** rows older than **`WA_QUEUE_CLEANUP_SENT_SKIPPED_DAYS`** days, and **`failed`** rows older than **`WA_QUEUE_CLEANUP_FAILED_DAYS`** days — plus their `whatsapp_messages_log` rows linked by `queue_id`.
+
+**Queue tuning (optional)**
+
+- `WA_WORKER_INSTANCE_ID` — stable id logged in Postgres on claimed rows (default random `wa:<uuid>`).
+- `WA_QUEUE_BATCH_SIZE` — claimed rows per tick (default `5`, max `75`).
+- `WA_QUEUE_RETRY_BASE_MS`, `WA_QUEUE_RETRY_MAX_MS`, `WA_QUEUE_RETRY_JITTER_MS` — reschedule curve after failed sends.
 
 **Pairing:** use **Admin → Settings → WhatsApp** for that academy: “Show QR code to link WhatsApp”. The worker writes the QR into the database; scan it with WhatsApp → Linked devices. Persist the **`auth_info_baileys`** directory (or a Railway volume mounted there) across deploys.
 
-**One worker per database:** do not run multiple replicas of this process for the same `DATABASE_URL`. Competing processes will reconnect and rotate QR codes, and phones often show “couldn’t link device”.
+**Database-level queue safety:** two workers polling the same `DATABASE_URL` will not dequeue the same row thanks to transactional claiming — but Baileys is still happiest with **one send worker per academy** session (paired device / QR contention). Prefer a single replica or separate DBs when possible.
 
 ## Keep sessions across deploys (important)
 
