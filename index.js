@@ -901,6 +901,7 @@ async function resolveRecipientJid (tenantId, sock, recipientRaw) {
 }
 
 const LATE_START_MESSAGE_TYPES = new Set(['class_reminder_late', 'class_reminder_teacher_late'])
+const CLASS_REMINDER_MESSAGE_TYPES = new Set(['class_reminder', 'class_reminder_teacher'])
 const ASSIGNMENT_MEDIA_MESSAGE_TYPE = 'assignment_created_parent_media'
 const SESSION_HOMEWORK_MEDIA_MESSAGE_TYPE = 'session_attendance_homework_media'
 
@@ -1325,6 +1326,148 @@ async function abandonStaleLateReminderIfNeeded (row) {
   return true
 }
 
+/**
+ * Session-scoped WhatsApp: do not deliver if student, teacher, or linked family is operationally inactive.
+ * Terminates queue row without network send or retries.
+ */
+async function skipOperationalInactiveQueueRow (row) {
+  const sessionId = row.session_id ? String(row.session_id).trim() : ''
+  if (!sessionId) return false
+  const tenantId = row.tenant_id
+  try {
+    const q = await pool.query(
+      `select
+         coalesce(sp.status, 'active') as student_status,
+         coalesce(tp.status, 'active') as teacher_status,
+         fp.status as family_status
+       from public.sessions s
+       inner join public.profiles sp on sp.id = s.student_id and sp.tenant_id = s.tenant_id
+       inner join public.profiles tp on tp.id = s.teacher_id and tp.tenant_id = s.tenant_id
+       left join public.student_details sd on sd.profile_id = s.student_id
+       left join public.family_profiles fp
+         on fp.tenant_id = s.tenant_id and fp.parent_profile_id = sd.parent_profile_id
+       where s.tenant_id = $1::uuid and s.id = $2::uuid
+       limit 1`,
+      [tenantId, sessionId]
+    )
+    const r = q.rows[0]
+    if (!r) return false
+    const inactiveStu = String(r.student_status ?? 'active').trim().toLowerCase() === 'inactive'
+    const inactiveTea = String(r.teacher_status ?? 'active').trim().toLowerCase() === 'inactive'
+    const famRaw = r.family_status
+    const hasFam = famRaw != null && String(famRaw).trim() !== ''
+    const inactiveFam = hasFam && String(famRaw).trim().toLowerCase() === 'inactive'
+    if (!inactiveStu && !inactiveTea && !inactiveFam) return false
+    const sentAt = new Date().toISOString()
+    await pool.query(
+      `update public.whatsapp_queue
+       set status = 'sent', sent_at = $1::timestamptz, error = 'skipped_inactive_entity'
+       where id = $2::uuid`,
+      [sentAt, row.id]
+    )
+    await pool.query(
+      `update public.whatsapp_messages_log
+       set error = 'skipped_inactive_entity'
+       where queue_id = $1::uuid and error is null`,
+      [row.id]
+    )
+    logger.info(
+      {
+        queueId: row.id,
+        sessionId,
+        inactiveStu,
+        inactiveTea,
+        inactiveFam
+      },
+      '[wa-worker] skipped send — operational inactive entity'
+    )
+    return true
+  } catch (err) {
+    logger.warn(
+      { queueId: row.id, err: err instanceof Error ? err.message : String(err) },
+      '[wa-worker] operational skip check failed — proceeding to send'
+    )
+    return false
+  }
+}
+
+/**
+ * Class reminders: do not send if the session row was deleted or is no longer active.
+ * @returns {Promise<boolean>} true if row was skipped (caller must not send)
+ */
+async function skipClassReminderIfSessionNotSendable (row) {
+  const messageType = row.message_type ?? ''
+  if (!CLASS_REMINDER_MESSAGE_TYPES.has(messageType)) return false
+  const sessionId = row.session_id ? String(row.session_id).trim() : ''
+  if (!sessionId) return false
+  const tenantId = row.tenant_id
+  try {
+    const q = await pool.query(
+      `select status from public.sessions where tenant_id = $1::uuid and id = $2::uuid limit 1`,
+      [tenantId, sessionId]
+    )
+    const r0 = q.rows[0]
+    if (!r0) {
+      const sentAt = new Date().toISOString()
+      const errCode = 'skipped_missing_session'
+      await pool.query(
+        `update public.whatsapp_queue
+         set status = 'sent', sent_at = $1::timestamptz, error = $2
+         where id = $3::uuid`,
+        [sentAt, errCode, row.id]
+      )
+      await pool.query(
+        `update public.whatsapp_messages_log
+         set error = $1
+         where queue_id = $2::uuid and error is null`,
+        [errCode, row.id]
+      )
+      logger.info(
+        { queueId: row.id, sessionId, messageType },
+        '[wa-worker] skipped class reminder — session no longer exists'
+      )
+      return true
+    }
+    const low = String(r0.status ?? '').toLowerCase()
+    if (low === 'completed' || low === 'no_show' || low.startsWith('cancel')) {
+      const sentAt = new Date().toISOString()
+      const errCode = 'skipped_session_not_active'
+      await pool.query(
+        `update public.whatsapp_queue
+         set status = 'sent', sent_at = $1::timestamptz, error = $2
+         where id = $3::uuid`,
+        [sentAt, errCode, row.id]
+      )
+      await pool.query(
+        `update public.whatsapp_messages_log
+         set error = $1
+         where queue_id = $2::uuid and error is null`,
+        [errCode, row.id]
+      )
+      logger.info(
+        {
+          queueId: row.id,
+          sessionId,
+          messageType,
+          sessionStatus: r0.status
+        },
+        '[wa-worker] skipped class reminder — session cancelled or finished'
+      )
+      return true
+    }
+    return false
+  } catch (err) {
+    logger.warn(
+      {
+        queueId: row.id,
+        err: err instanceof Error ? err.message : String(err)
+      },
+      '[wa-worker] class-reminder session guard failed — proceeding to send'
+    )
+    return false
+  }
+}
+
 async function sendOnce (row) {
   const tenantId = row.tenant_id
   const s = await getSockForSend(tenantId)
@@ -1417,6 +1560,10 @@ async function pollLoop () {
           try {
             const abandoned = await abandonStaleLateReminderIfNeeded(row)
             if (abandoned) continue
+            const skippedInactive = await skipOperationalInactiveQueueRow(row)
+            if (skippedInactive) continue
+            const skippedClassReminder = await skipClassReminderIfSessionNotSendable(row)
+            if (skippedClassReminder) continue
             /** Skip rows whose tenant is not linked (without burning a retry slot). */
             if (!hasPersistedCreds(row.tenant_id)) {
               /** Explain in DB/UI why pending rows never leave — without failing the row (sends after pairing). */
