@@ -53,10 +53,12 @@ function disconnectReasonLabel (code) {
 }
 
 const databaseUrl = (process.env.DATABASE_URL || '').trim()
+/** Worker uses app_runtime (DATABASE_URL) + SET LOCAL app.tenant_id per transaction. */
+const poolConnectionString = databaseUrl
 
 function dbHostHint () {
   try {
-    const normalized = databaseUrl.replace(/^postgres(ql)?:\/\//i, 'http://')
+    const normalized = poolConnectionString.replace(/^postgres(ql)?:\/\//i, 'http://')
     return new URL(normalized).host
   } catch {
     return '(invalid DATABASE_URL)'
@@ -138,10 +140,10 @@ if (!databaseUrl) {
 }
 
 const pool = new pg.Pool({
-  connectionString: databaseUrl,
+  connectionString: poolConnectionString,
   max: 8,
   idleTimeoutMillis: 30_000,
-  ssl: /localhost|127\.0\.0\.1/i.test(databaseUrl)
+  ssl: /localhost|127\.0\.0\.1/i.test(poolConnectionString)
     ? false
     : { rejectUnauthorized: false }
 })
@@ -151,6 +153,7 @@ logger.info(
     pollMs,
     sessionPollMs,
     logLevel,
+    dbPool: 'app_runtime',
     dbHost: dbHostHint(),
     authRoot,
     authRootFromEnv: Boolean(authRootRaw),
@@ -165,6 +168,68 @@ logger.info(
 )
 
 const SESSION_LABEL = 'default'
+
+/** Run SQL with SET LOCAL app.tenant_id (RLS on whatsapp_sessions, etc.). */
+async function withTenantTxn (tenantId, run) {
+  const tid = String(tenantId ?? '').trim()
+  if (!tid) throw new Error('withTenantTxn: empty tenantId')
+  const client = await pool.connect()
+  try {
+    await client.query('begin')
+    await client.query(`select set_config('app.tenant_id', $1, true)`, [tid])
+    const out = await run(client)
+    await client.query('commit')
+    return out
+  } catch (err) {
+    await client.query('rollback').catch(() => {})
+    if (err && typeof err === 'object' && err.code === '42501') {
+      logger.error(
+        {
+          tenantId: tid,
+          pgCode: err.code,
+          message: err.message,
+          sqlOrigin: 'withTenantTxn'
+        },
+        '[wa-worker] rls_query_denied'
+      )
+    }
+    throw err
+  } finally {
+    client.release()
+  }
+}
+
+async function listWhatsappWorkerTenantIds () {
+  const ids = new Set()
+  try {
+    const listed = await pool.query(
+      `select tenant_id from public.worker_list_whatsapp_tenant_ids($1)`,
+      [SESSION_LABEL]
+    )
+    for (const r of listed.rows ?? []) {
+      if (r.tenant_id) ids.add(String(r.tenant_id))
+    }
+  } catch (err) {
+    logger.warn(
+      { err: err instanceof Error ? err.message : String(err) },
+      '[wa-worker] worker_list_whatsapp_tenant_ids unavailable — union queue tenants only'
+    )
+  }
+  try {
+    const q = await pool.query(
+      `select distinct tenant_id from public.whatsapp_queue where tenant_id is not null`
+    )
+    for (const r of q.rows ?? []) {
+      if (r.tenant_id) ids.add(String(r.tenant_id))
+    }
+  } catch (err) {
+    logger.error(
+      { err: err instanceof Error ? err.message : String(err) },
+      '[wa-worker] distinct queue tenant_id failed'
+    )
+  }
+  return [...ids]
+}
 
 /** @type {Map<string, number>} */
 const notLinkedLastLogged = new Map()
@@ -291,18 +356,21 @@ function computeRetryDelayMs (retryCountAfterIncrement, idSeed) {
 }
 
 async function finalizeQueueSkipped (queueRow, errCode, logFields = {}) {
-  const qr = await pool.query(
-    `update public.whatsapp_queue
-     set status = 'skipped',
-         sent_at = coalesce(sent_at, now()),
-         error = $1,
-         processing_started_at = null,
-         processing_owner = null
-     where id = $2::uuid
-       and processing_owner = $3
-       and status = 'processing'
-     returning id`,
-    [errCode, queueRow.id, WORKER_INSTANCE_ID]
+  const tid = queueRow.tenant_id
+  const qr = await withTenantTxn(tid, (client) =>
+    client.query(
+      `update public.whatsapp_queue
+       set status = 'skipped',
+           sent_at = coalesce(sent_at, now()),
+           error = $1,
+           processing_started_at = null,
+           processing_owner = null
+       where id = $2::uuid
+         and processing_owner = $3
+         and status = 'processing'
+       returning id`,
+      [errCode, queueRow.id, WORKER_INSTANCE_ID]
+    )
   )
   if (!(qr.rowCount > 0)) {
     logger.warn(
@@ -311,12 +379,14 @@ async function finalizeQueueSkipped (queueRow, errCode, logFields = {}) {
     )
     return
   }
-  await pool.query(
-    `update public.whatsapp_messages_log
-     set status = 'skipped',
-         error = $1
-     where queue_id = $2::uuid`,
-    [errCode, queueRow.id]
+  await withTenantTxn(tid, (client) =>
+    client.query(
+      `update public.whatsapp_messages_log
+       set status = 'skipped',
+           error = $1
+       where queue_id = $2::uuid`,
+      [errCode, queueRow.id]
+    )
   )
   logger.info({ queueId: queueRow.id, errCode, ...logFields }, '[wa-worker] queue row skipped')
 }
@@ -327,25 +397,30 @@ async function releaseNotLinkedDefer (queueRow) {
     ((String(queueRow.id).charCodeAt(0) || 0) % 45) * 1000
   const deferredUntil = new Date(Date.now() + deferMs).toISOString()
   const notLinkedErr = 'whatsapp_not_linked'
-  const ur = await pool.query(
-    `update public.whatsapp_queue
-     set scheduled_at = $1::timestamptz,
-         status = 'pending',
-         error = coalesce(error, $2),
-         processing_started_at = null,
-         processing_owner = null,
-         last_attempt_at = now()
-     where id = $3::uuid
-       and processing_owner = $4
-       and status = 'processing'`,
-    [deferredUntil, notLinkedErr, queueRow.id, WORKER_INSTANCE_ID]
+  const tid = queueRow.tenant_id
+  const ur = await withTenantTxn(tid, (client) =>
+    client.query(
+      `update public.whatsapp_queue
+       set scheduled_at = $1::timestamptz,
+           status = 'pending',
+           error = coalesce(error, $2),
+           processing_started_at = null,
+           processing_owner = null,
+           last_attempt_at = now()
+       where id = $3::uuid
+         and processing_owner = $4
+         and status = 'processing'`,
+      [deferredUntil, notLinkedErr, queueRow.id, WORKER_INSTANCE_ID]
+    )
   )
   if (!(ur.rowCount > 0)) return
-  await pool.query(
-    `update public.whatsapp_messages_log
-     set error = $1
-     where queue_id = $2::uuid and error is null`,
-    [notLinkedErr, queueRow.id]
+  await withTenantTxn(tid, (client) =>
+    client.query(
+      `update public.whatsapp_messages_log
+       set error = $1
+       where queue_id = $2::uuid and error is null`,
+      [notLinkedErr, queueRow.id]
+    )
   )
   const now = Date.now()
   const last = notLinkedLastLogged.get(queueRow.tenant_id) ?? 0
@@ -591,11 +666,13 @@ async function updateSession (tenantId, patch) {
     i += 1
   }
   try {
-    const res = await pool.query(
-      `update public.whatsapp_sessions set ${fragments.join(', ')}
-       where tenant_id = $1::uuid and label = $2
-       returning id`,
-      params
+    const res = await withTenantTxn(tenantId, (client) =>
+      client.query(
+        `update public.whatsapp_sessions set ${fragments.join(', ')}
+         where tenant_id = $1::uuid and label = $2
+         returning id`,
+        params
+      )
     )
     if (logDebug && res.rowCount) {
       logger.debug({ tenantId, keys: Object.keys(patch) }, '[wa-worker] session row updated')
@@ -770,10 +847,12 @@ function scheduleReconnectPairing (tenantId, delayMs, closeMeta) {
       }
       let row = null
       try {
-        const res = await pool.query(
-          `select pairing_requested_at from public.whatsapp_sessions
-           where tenant_id = $1::uuid and label = $2 limit 1`,
-          [tenantId, SESSION_LABEL]
+        const res = await withTenantTxn(tenantId, (client) =>
+          client.query(
+            `select pairing_requested_at from public.whatsapp_sessions
+             where tenant_id = $1::uuid and label = $2 limit 1`,
+            [tenantId, SESSION_LABEL]
+          )
         )
         row = res.rows[0] ?? null
       } catch (err) {
@@ -1028,11 +1107,18 @@ async function pollSessions () {
   try {
     let rows = []
     try {
-      const res = await pool.query(
-        `select ${SESSION_POLL_COLUMNS} from public.whatsapp_sessions where label = $1`,
-        [SESSION_LABEL]
-      )
-      rows = res.rows
+      const tenantIds = await listWhatsappWorkerTenantIds()
+      for (const tid of tenantIds) {
+        const res = await withTenantTxn(tid, (client) =>
+          client.query(
+            `select ${SESSION_POLL_COLUMNS} from public.whatsapp_sessions
+             where label = $1 and tenant_id = $2::uuid
+             limit 1`,
+            [SESSION_LABEL, tid]
+          )
+        )
+        if (res.rows[0]) rows.push(res.rows[0])
+      }
     } catch (err) {
       logger.error(
         { err: err instanceof Error ? err.message : String(err) },
@@ -1093,14 +1179,22 @@ async function pollSessions () {
       } else {
         if (!row.pairing_requested_at && tenantSockets.has(tid)) {
           const ent = tenantSockets.get(tid)
-          if (!ent?.sock?.user && !hasPersistedCreds(tid)) {
-            await destroyTenantSocket(tid)
-            pairingHandled.delete(tid)
-            await updateSession(tid, {
-              pairing_qr: null,
-              status: row.linked_wa_jid ? 'connected' : 'disconnected'
-            })
-            continue
+          if (!ent?.sock?.user) {
+            const shouldKill =
+              !hasPersistedCreds(tid) || !row.linked_wa_jid
+            if (shouldKill) {
+              logger.info(
+                { tid, hadCreds: hasPersistedCreds(tid), linked: Boolean(row.linked_wa_jid) },
+                '[wa-worker] pairing stopped or abandoned — closing socket without WA user'
+              )
+              await destroyTenantSocket(tid)
+              pairingHandled.delete(tid)
+              await updateSession(tid, {
+                pairing_qr: null,
+                status: row.linked_wa_jid ? 'connected' : 'disconnected'
+              })
+              continue
+            }
           }
         }
         if (
@@ -1125,11 +1219,15 @@ async function pollSessions () {
       const tick = new Date().toISOString()
       const tenantIds = list.map((r) => r.tenant_id)
       try {
-        await pool.query(
-          `update public.whatsapp_sessions set worker_checked_at = $1::timestamptz
-           where label = $2 and tenant_id = any($3::uuid[])`,
-          [tick, SESSION_LABEL, tenantIds]
-        )
+        for (const tid of tenantIds) {
+          await withTenantTxn(tid, (client) =>
+            client.query(
+              `update public.whatsapp_sessions set worker_checked_at = $1::timestamptz
+               where label = $2 and tenant_id = $3::uuid`,
+              [tick, SESSION_LABEL, tid]
+            )
+          )
+        }
       } catch (tickErr) {
         logger.error(
           {
@@ -1379,15 +1477,18 @@ async function sendQueuedMedia (sock, jid, row) {
 async function cleanupSessionHomeworkReportAfterSend (row, media) {
   const sessionId = media.sessionId
   if (!sessionId) return
+  const tenantId = row.tenant_id
 
   let sess = null
   try {
-    const sRes = await pool.query(
-      `select id, session_report from public.sessions
-       where id = $1::uuid and tenant_id = $2::uuid limit 1`,
-      [sessionId, row.tenant_id]
-    )
-    sess = sRes.rows[0] ?? null
+    sess = await withTenantTxn(tenantId, async (client) => {
+      const sRes = await client.query(
+        `select id, session_report from public.sessions
+         where id = $1::uuid and tenant_id = $2::uuid limit 1`,
+        [sessionId, tenantId]
+      )
+      return sRes.rows[0] ?? null
+    })
   } catch (sErr) {
     logger.warn(
       {
@@ -1430,12 +1531,20 @@ async function cleanupSessionHomeworkReportAfterSend (row, media) {
   }
 
   try {
-    await pool.query(
-      `update public.sessions set session_report = $1::jsonb
-       where id = $2::uuid and tenant_id = $3::uuid`,
-      [JSON.stringify(report), sessionId, row.tenant_id]
+    await withTenantTxn(tenantId, (client) =>
+      client.query(
+        `update public.sessions set session_report = $1::jsonb
+         where id = $2::uuid and tenant_id = $3::uuid`,
+        [JSON.stringify(report), sessionId, tenantId]
+      )
     )
   } catch (uErr) {
+    if (uErr && typeof uErr === 'object' && uErr.code === '42501') {
+      logger.error(
+        { tenantId, sessionId, queueId: row.id, pgCode: uErr.code },
+        '[wa-worker] rls_query_denied session_report update'
+      )
+    }
     logger.warn(
       {
         queueId: row.id,
@@ -1560,14 +1669,29 @@ async function cleanupAfterQueuedMediaSend (row, media) {
 async function cleanupAssignmentsAttachmentsDbAfterSend (row, media) {
   if (!media.assignmentId) return
 
+  const tenantId = row.tenant_id
   let assignment = null
   try {
-    const aRes = await pool.query(
-      `select id, tenant_id, content, file_url from public.assignments
-       where id = $1::uuid and tenant_id = $2::uuid limit 1`,
-      [media.assignmentId, row.tenant_id]
-    )
-    assignment = aRes.rows[0] ?? null
+    assignment = await withTenantTxn(tenantId, async (client) => {
+      const aRes = await client.query(
+        `select id, tenant_id, content, file_url from public.assignments
+         where id = $1::uuid and tenant_id = $2::uuid limit 1`,
+        [media.assignmentId, tenantId]
+      )
+      const row0 = aRes.rows[0] ?? null
+      if (row0?.tenant_id && String(row0.tenant_id) !== String(tenantId)) {
+        logger.error(
+          {
+            tenantId,
+            actualTenantId: row0.tenant_id,
+            assignmentId: media.assignmentId,
+            queueId: row.id
+          },
+          '[wa-worker] unexpected_cross_tenant_row assignment cleanup'
+        )
+      }
+      return row0
+    })
   } catch (aErr) {
     logger.warn(
       {
@@ -1609,12 +1733,20 @@ async function cleanupAssignmentsAttachmentsDbAfterSend (row, media) {
   const nextFileUrl = assignment.file_url === media.path ? null : assignment.file_url
 
   try {
-    await pool.query(
-      `update public.assignments set content = $1::jsonb, file_url = $2
-       where id = $3::uuid and tenant_id = $4::uuid`,
-      [content, nextFileUrl, media.assignmentId, row.tenant_id]
+    await withTenantTxn(tenantId, (client) =>
+      client.query(
+        `update public.assignments set content = $1::jsonb, file_url = $2
+         where id = $3::uuid and tenant_id = $4::uuid`,
+        [content, nextFileUrl, media.assignmentId, tenantId]
+      )
     )
   } catch (uErr) {
+    if (uErr && typeof uErr === 'object' && uErr.code === '42501') {
+      logger.error(
+        { tenantId, assignmentId: media.assignmentId, queueId: row.id, pgCode: uErr.code },
+        '[wa-worker] rls_query_denied assignment cleanup update'
+      )
+    }
     logger.warn(
       {
         queueId: row.id,
@@ -1635,22 +1767,24 @@ async function skipOperationalInactiveQueueRow (row) {
   if (!sessionId) return false
   const tenantId = row.tenant_id
   try {
-    const q = await pool.query(
-      `select
-         coalesce(sp.status, 'active') as student_status,
-         coalesce(tp.status, 'active') as teacher_status,
-         fp.status as family_status
-       from public.sessions s
-       inner join public.profiles sp on sp.id = s.student_id and sp.tenant_id = s.tenant_id
-       inner join public.profiles tp on tp.id = s.teacher_id and tp.tenant_id = s.tenant_id
-       left join public.student_details sd on sd.profile_id = s.student_id
-       left join public.family_profiles fp
-         on fp.tenant_id = s.tenant_id and fp.parent_profile_id = sd.parent_profile_id
-       where s.tenant_id = $1::uuid and s.id = $2::uuid
-       limit 1`,
-      [tenantId, sessionId]
-    )
-    const r = q.rows[0]
+    const r = await withTenantTxn(tenantId, async (client) => {
+      const q = await client.query(
+        `select
+           coalesce(sp.status, 'active') as student_status,
+           coalesce(tp.status, 'active') as teacher_status,
+           fp.status as family_status
+         from public.sessions s
+         inner join public.profiles sp on sp.id = s.student_id and sp.tenant_id = s.tenant_id
+         inner join public.profiles tp on tp.id = s.teacher_id and tp.tenant_id = s.tenant_id
+         left join public.student_details sd on sd.profile_id = s.student_id
+         left join public.family_profiles fp
+           on fp.tenant_id = s.tenant_id and fp.parent_profile_id = sd.parent_profile_id
+         where s.tenant_id = $1::uuid and s.id = $2::uuid
+         limit 1`,
+        [tenantId, sessionId]
+      )
+      return q.rows[0]
+    })
     if (!r) return false
     const inactiveStu = String(r.student_status ?? 'active').trim().toLowerCase() === 'inactive'
     const inactiveTea = String(r.teacher_status ?? 'active').trim().toLowerCase() === 'inactive'
@@ -1685,11 +1819,13 @@ async function skipClassReminderIfSessionNotSendable (row) {
   if (!sessionId) return false
   const tenantId = row.tenant_id
   try {
-    const q = await pool.query(
-      `select status from public.sessions where tenant_id = $1::uuid and id = $2::uuid limit 1`,
-      [tenantId, sessionId]
-    )
-    const r0 = q.rows[0]
+    const r0 = await withTenantTxn(tenantId, async (client) => {
+      const q = await client.query(
+        `select status from public.sessions where tenant_id = $1::uuid and id = $2::uuid limit 1`,
+        [tenantId, sessionId]
+      )
+      return q.rows[0]
+    })
     if (!r0) {
       const errCode = 'skipped_missing_session'
       await finalizeQueueSkipped(row, errCode, {

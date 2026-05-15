@@ -6,7 +6,8 @@ Run this as a **separate Node process** (Docker, VPS, Railway). It is not part o
 
 From the **repo root** `.env.local` (loaded automatically on `npm start`):
 
-- `DATABASE_URL` — Postgres connection string (same as the Next.js app; Neon or self-hosted)
+- `DATABASE_URL` — **app_runtime** (RLS enforced), same Neon project as the Next.js app.
+- `DATABASE_MAINTENANCE_URL` — optional **owner** URL (`neondb_owner`). When set, the worker uses it for **all** DB access (bypasses RLS). Use temporarily while tightening worker SQL to tenant-scoped transactions; otherwise omit so the pool stays on `app_runtime`.
 
 **Assignment media (optional):** when sending assignment files/images, the worker downloads from public R2 URLs and deletes via HTTP when configured:
 
