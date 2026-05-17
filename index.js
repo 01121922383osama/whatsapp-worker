@@ -327,16 +327,57 @@ async function persistParticipatingGroupSubjects (tenantId, groups) {
   const subjects = groups
     .map((g) => String(g?.subject ?? '').trim())
     .filter(Boolean)
-  await updateSession(tenantId, {
-    participating_group_subjects: subjects,
-    participating_groups_cached_at: new Date().toISOString()
-  })
+  try {
+    await updateSession(tenantId, {
+      participating_group_subjects: subjects,
+      participating_groups_cached_at: new Date().toISOString()
+    })
+    if (logDebug) {
+      logger.debug(
+        { tenantId, subjectCount: subjects.length },
+        '[wa-worker] participating group subjects persisted'
+      )
+    }
+  } catch (err) {
+    logger.warn(
+      {
+        tenantId,
+        err: err instanceof Error ? err.message : String(err)
+      },
+      '[wa-worker] persist participating group subjects failed'
+    )
+  }
+}
+
+async function refreshAndPersistParticipatingGroups (tenantId, sock) {
+  try {
+    const map = await sock.groupFetchAllParticipating()
+    const groups = Object.values(map).map((g) => ({
+      id: String(g?.id ?? ''),
+      subject: String(g?.subject ?? '').trim()
+    }))
+    tenantGroupsCache.set(tenantId, { at: Date.now(), groups })
+    await persistParticipatingGroupSubjects(tenantId, groups)
+    logger.info(
+      { tenantId, groupCount: groups.length },
+      '[wa-worker] group list refreshed for admin UI'
+    )
+  } catch (err) {
+    logger.warn(
+      {
+        tenantId,
+        err: err instanceof Error ? err.message : String(err)
+      },
+      '[wa-worker] refresh participating groups failed'
+    )
+  }
 }
 
 async function getCachedGroups (tenantId, sock) {
   const now = Date.now()
   const cached = tenantGroupsCache.get(tenantId)
   if (cached && now - cached.at < GROUPS_CACHE_TTL_MS) {
+    void persistParticipatingGroupSubjects(tenantId, cached.groups)
     return cached.groups
   }
   const map = await sock.groupFetchAllParticipating()
@@ -345,7 +386,7 @@ async function getCachedGroups (tenantId, sock) {
     subject: String(g?.subject ?? '').trim()
   }))
   tenantGroupsCache.set(tenantId, { at: now, groups })
-  void persistParticipatingGroupSubjects(tenantId, groups)
+  await persistParticipatingGroupSubjects(tenantId, groups)
   return groups
 }
 
@@ -990,6 +1031,7 @@ async function startSocket (tenantId, ctx) {
         last_error: null,
         worker_checked_at: new Date().toISOString()
       })
+      void refreshAndPersistParticipatingGroups(tenantId, sock)
     }
 
     if (connection === 'close') {
