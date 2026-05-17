@@ -323,6 +323,16 @@ function shouldWipeAuth (tenantId) {
 const tenantGroupsCache = new Map()
 const GROUPS_CACHE_TTL_MS = 60_000
 
+async function persistParticipatingGroupSubjects (tenantId, groups) {
+  const subjects = groups
+    .map((g) => String(g?.subject ?? '').trim())
+    .filter(Boolean)
+  await updateSession(tenantId, {
+    participating_group_subjects: subjects,
+    participating_groups_cached_at: new Date().toISOString()
+  })
+}
+
 async function getCachedGroups (tenantId, sock) {
   const now = Date.now()
   const cached = tenantGroupsCache.get(tenantId)
@@ -335,6 +345,7 @@ async function getCachedGroups (tenantId, sock) {
     subject: String(g?.subject ?? '').trim()
   }))
   tenantGroupsCache.set(tenantId, { at: now, groups })
+  void persistParticipatingGroupSubjects(tenantId, groups)
   return groups
 }
 
