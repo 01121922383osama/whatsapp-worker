@@ -274,6 +274,10 @@ function hasPersistedCreds (tenantId) {
 /** @type {Map<string, { sock: any }>} */
 const tenantSockets = new Map()
 
+/** Serialize startSocket per tenant so poll + send + reconnect don't open parallel WA sessions (440 connectionReplaced). */
+/** @type {Map<string, Promise<void>>} */
+const tenantSocketStarts = new Map()
+
 /**
  * Rolling-window counter for transient session-level failures (Bad MAC, decrypt,
  * verifymac, init queries, code 500). Baileys usually self-heals these by
@@ -707,14 +711,36 @@ function previewBody (text, max = 160) {
   return `${s.slice(0, max)}…`
 }
 
+/** jsonb columns on whatsapp_sessions — node-pg treats JS arrays as PG arrays, not JSON */
+const SESSION_JSONB_COLS = new Set([
+  'metadata',
+  'participating_group_subjects'
+])
+
+function encodeSessionPatchValue (col, val) {
+  if (val == null) return val
+  if (SESSION_JSONB_COLS.has(col)) {
+    // Objects/arrays must be JSON text; pg otherwise sends array literals like {a,b}
+    // which Postgres rejects for jsonb ("invalid input syntax for type json").
+    if (typeof val === 'string') return val
+    return JSON.stringify(val)
+  }
+  return val
+}
+
 async function updateSession (tenantId, patch) {
   const merged = { ...patch, updated_at: new Date().toISOString() }
   const fragments = []
   const params = [tenantId, SESSION_LABEL]
   let i = 3
   for (const [col, val] of Object.entries(merged)) {
-    fragments.push(`${col} = $${i}`)
-    params.push(val)
+    const encoded = encodeSessionPatchValue(col, val)
+    if (SESSION_JSONB_COLS.has(col) && encoded != null) {
+      fragments.push(`${col} = $${i}::jsonb`)
+    } else {
+      fragments.push(`${col} = $${i}`)
+    }
+    params.push(encoded)
     i += 1
   }
   try {
@@ -938,6 +964,35 @@ function scheduleReconnectPairing (tenantId, delayMs, closeMeta) {
  * @param {{ mode: 'send' | 'pairing' }} ctx
  */
 async function startSocket (tenantId, ctx) {
+  for (;;) {
+    const prev = tenantSocketStarts.get(tenantId)
+    if (!prev) break
+    try {
+      await prev
+    } catch {
+      /* previous start failed; retry lock */
+    }
+    if (ctx.mode === 'send' && tenantSockets.get(tenantId)?.sock?.user) {
+      return
+    }
+  }
+
+  const run = startSocketInner(tenantId, ctx)
+  tenantSocketStarts.set(tenantId, run)
+  try {
+    await run
+  } finally {
+    if (tenantSocketStarts.get(tenantId) === run) {
+      tenantSocketStarts.delete(tenantId)
+    }
+  }
+}
+
+/**
+ * @param {string} tenantId
+ * @param {{ mode: 'send' | 'pairing' }} ctx
+ */
+async function startSocketInner (tenantId, ctx) {
   await destroyTenantSocket(tenantId)
   lastPairingQrWritten.delete(tenantId)
 
@@ -2189,6 +2244,31 @@ function onShutdownSignal (signal) {
 
 process.once('SIGTERM', () => onShutdownSignal('SIGTERM'))
 process.once('SIGINT', () => onShutdownSignal('SIGINT'))
+
+/** Baileys fires unhandled Timed Out on init queries / pre-keys; don't kill the worker. */
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason ?? '')
+  const status =
+    reason && typeof reason === 'object' && reason.output
+      ? reason.output.statusCode
+      : null
+  if (
+    msg === 'Timed Out' ||
+    status === 408 ||
+    /timed out/i.test(msg)
+  ) {
+    logger.error(
+      { err: msg, status },
+      '[wa-worker] unhandled Baileys timeout (ignored — socket will reconnect)'
+    )
+    return
+  }
+  logger.fatal(
+    { err: msg, stack: reason instanceof Error ? reason.stack : undefined },
+    '[wa-worker] unhandledRejection'
+  )
+  process.exit(1)
+})
 
 sessionPollTimer = setInterval(() => {
   void pollSessions()
