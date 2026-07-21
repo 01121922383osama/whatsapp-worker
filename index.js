@@ -200,35 +200,25 @@ async function withTenantTxn (tenantId, run) {
 }
 
 async function listWhatsappWorkerTenantIds () {
-  const ids = new Set()
+  // SECURITY DEFINER RPC — includes sessions + pending queue tenants (RLS-safe).
+  // Do not SELECT whatsapp_queue without SET LOCAL app.tenant_id.
   try {
     const listed = await pool.query(
       `select tenant_id from public.worker_list_whatsapp_tenant_ids($1)`,
       [SESSION_LABEL]
     )
+    const ids = []
     for (const r of listed.rows ?? []) {
-      if (r.tenant_id) ids.add(String(r.tenant_id))
+      if (r.tenant_id) ids.push(String(r.tenant_id))
     }
-  } catch (err) {
-    logger.warn(
-      { err: err instanceof Error ? err.message : String(err) },
-      '[wa-worker] worker_list_whatsapp_tenant_ids unavailable — union queue tenants only'
-    )
-  }
-  try {
-    const q = await pool.query(
-      `select distinct tenant_id from public.whatsapp_queue where tenant_id is not null`
-    )
-    for (const r of q.rows ?? []) {
-      if (r.tenant_id) ids.add(String(r.tenant_id))
-    }
+    return ids
   } catch (err) {
     logger.error(
       { err: err instanceof Error ? err.message : String(err) },
-      '[wa-worker] distinct queue tenant_id failed'
+      '[wa-worker] worker_list_whatsapp_tenant_ids failed'
     )
+    return []
   }
-  return [...ids]
 }
 
 /** @type {Map<string, number>} */
@@ -491,201 +481,230 @@ async function releaseNotLinkedDefer (queueRow) {
 
 async function recoverStaleProcessingRows () {
   const staleSec = Math.max(30, Math.floor(QUEUE_PROCESSING_TIMEOUT_MS / 1000))
-  const client = await pool.connect()
-  try {
-    await client.query('begin')
-    const stale = await client.query(
-      `select id,
-              tenant_id,
-              processing_recovery_count,
-              processing_owner
-       from public.whatsapp_queue
-       where status = 'processing'
-         and processing_started_at < now () - $1::interval
-       order by processing_started_at asc, id asc
-       limit 100
-       for update skip locked`,
-      [`${staleSec} seconds`]
-    )
-    for (const row of stale.rows) {
-      const recoveries =
-        Math.min(999, (Number(row.processing_recovery_count) || 0) + 1)
-      if (recoveries > STALE_RECOVERY_CAP) {
-        await client.query(
-          `update public.whatsapp_queue
-           set status = 'failed',
-               error = 'stale_processing_gave_up',
-               processing_started_at = null,
-               processing_owner = null,
-               last_attempt_at = now (),
-               processing_recovery_count = $2
-           where id = $1::uuid`,
-          [row.id, recoveries]
-        )
-        await client.query(
-          `update public.whatsapp_messages_log
-           set status = 'failed',
-               error = 'stale_processing_gave_up'
-           where queue_id = $1::uuid`,
-          [row.id]
-        )
-        logger.error(
-          {
-            queueId: row.id,
-            tenantId: row.tenant_id,
-            staleRecoveries: recoveries,
-            staleOwner: row.processing_owner
-          },
-          '[wa-worker] stale processing exceeded recovery cap — failed'
-        )
-      } else {
-        const delay = computeRetryDelayMs(recoveries, String(row.id))
-        const nextAt = new Date(Date.now() + delay).toISOString()
-        const note =
-          'stale_processing_recovered:' +
-          `owner=${((row.processing_owner ?? '') + '').trim() || '?'}:${recoveries}`
-        await client.query(
-          `update public.whatsapp_queue
-           set status = 'pending',
-               scheduled_at = $2::timestamptz,
-               processing_started_at = null,
-               processing_owner = null,
-               processing_recovery_count = $3,
-               error = coalesce (error, $4),
-               last_attempt_at = now ()
-           where id = $1::uuid`,
-          [row.id, nextAt, recoveries, note]
-        )
-        logger.warn(
-          {
-            queueId: row.id,
-            tenantId: row.tenant_id,
-            staleRecoveries: recoveries,
-            staleOwner: row.processing_owner,
-            nextScheduledAt: nextAt
-          },
-          '[wa-worker] stale processing recovered → pending'
-        )
-      }
-    }
-    await client.query('commit')
-  } catch (err) {
+  const tenantIds = await listWhatsappWorkerTenantIds()
+  for (const tenantId of tenantIds) {
     try {
-      await client.query('rollback')
-    } catch (_) {}
-    logger.error(
-      { err: err instanceof Error ? err.message : String(err) },
-      '[wa-worker] stale recovery txn failed'
-    )
-  } finally {
-    client.release()
+      await withTenantTxn(tenantId, async (client) => {
+        const stale = await client.query(
+          `select id,
+                  tenant_id,
+                  processing_recovery_count,
+                  processing_owner
+           from public.whatsapp_queue
+           where status = 'processing'
+             and processing_started_at < now () - $1::interval
+           order by processing_started_at asc, id asc
+           limit 100
+           for update skip locked`,
+          [`${staleSec} seconds`]
+        )
+        for (const row of stale.rows) {
+          const recoveries =
+            Math.min(999, (Number(row.processing_recovery_count) || 0) + 1)
+          if (recoveries > STALE_RECOVERY_CAP) {
+            await client.query(
+              `update public.whatsapp_queue
+               set status = 'failed',
+                   error = 'stale_processing_gave_up',
+                   processing_started_at = null,
+                   processing_owner = null,
+                   last_attempt_at = now (),
+                   processing_recovery_count = $2
+               where id = $1::uuid`,
+              [row.id, recoveries]
+            )
+            await client.query(
+              `update public.whatsapp_messages_log
+               set status = 'failed',
+                   error = 'stale_processing_gave_up'
+               where queue_id = $1::uuid`,
+              [row.id]
+            )
+            logger.error(
+              {
+                queueId: row.id,
+                tenantId: row.tenant_id,
+                staleRecoveries: recoveries,
+                staleOwner: row.processing_owner
+              },
+              '[wa-worker] stale processing exceeded recovery cap — failed'
+            )
+          } else {
+            const delay = computeRetryDelayMs(recoveries, String(row.id))
+            const nextAt = new Date(Date.now() + delay).toISOString()
+            const note =
+              'stale_processing_recovered:' +
+              `owner=${((row.processing_owner ?? '') + '').trim() || '?'}:${recoveries}`
+            await client.query(
+              `update public.whatsapp_queue
+               set status = 'pending',
+                   scheduled_at = $2::timestamptz,
+                   processing_started_at = null,
+                   processing_owner = null,
+                   processing_recovery_count = $3,
+                   error = coalesce (error, $4),
+                   last_attempt_at = now ()
+               where id = $1::uuid`,
+              [row.id, nextAt, recoveries, note]
+            )
+            logger.warn(
+              {
+                queueId: row.id,
+                tenantId: row.tenant_id,
+                staleRecoveries: recoveries,
+                staleOwner: row.processing_owner,
+                nextScheduledAt: nextAt
+              },
+              '[wa-worker] stale processing recovered → pending'
+            )
+          }
+        }
+      })
+    } catch (err) {
+      logger.error(
+        {
+          tenantId,
+          err: err instanceof Error ? err.message : String(err)
+        },
+        '[wa-worker] stale recovery txn failed'
+      )
+    }
   }
 }
 
 async function cleanupOldTerminalRowsBatch () {
   const sentCut =
-    Date.now () - CLEANUP_SENT_SKIPPED_DAYS * DAY_MS
+    Date.now() - CLEANUP_SENT_SKIPPED_DAYS * DAY_MS
   const failCut =
-    Date.now () - CLEANUP_FAILED_DAYS * DAY_MS
-  try {
-    const r1 = await pool.query(
-      `with doomed as (
-         select id
-         from public.whatsapp_queue
-         where status in ('sent', 'skipped')
-           and coalesce(sent_at, created_at, now ()) < ($1::timestamptz)
-         order by coalesce(sent_at, created_at), id
-         limit $2
-       ),
-       dl as (
-         delete from public.whatsapp_messages_log m
-         using doomed d
-         where m.queue_id = d.id
-         returning m.queue_id
-       )
-       delete from public.whatsapp_queue q
-       using doomed d
-       where q.id = d.id`,
-      [new Date(sentCut).toISOString(), CLEANUP_BATCH]
-    )
-    const n1 = r1.rowCount ?? 0
-    if (n1 > 0) {
-      logger.info(
+    Date.now() - CLEANUP_FAILED_DAYS * DAY_MS
+  const tenantIds = await listWhatsappWorkerTenantIds()
+  for (const tenantId of tenantIds) {
+    try {
+      await withTenantTxn(tenantId, async (client) => {
+        const r1 = await client.query(
+          `with doomed as (
+             select id
+             from public.whatsapp_queue
+             where status in ('sent', 'skipped')
+               and coalesce(sent_at, created_at, now ()) < ($1::timestamptz)
+             order by coalesce(sent_at, created_at), id
+             limit $2
+           ),
+           dl as (
+             delete from public.whatsapp_messages_log m
+             using doomed d
+             where m.queue_id = d.id
+             returning m.queue_id
+           )
+           delete from public.whatsapp_queue q
+           using doomed d
+           where q.id = d.id`,
+          [new Date(sentCut).toISOString(), CLEANUP_BATCH]
+        )
+        const n1 = r1.rowCount ?? 0
+        if (n1 > 0) {
+          logger.info(
+            {
+              tenantId,
+              deleted: n1,
+              cutoff: new Date(sentCut).toISOString(),
+              kind: 'sent_skipped_batch'
+            },
+            '[wa-worker] cleanup old terminal rows'
+          )
+        }
+        const r2 = await client.query(
+          `with doomed as (
+             select id
+             from public.whatsapp_queue
+             where status = 'failed'
+               and created_at < ($1::timestamptz)
+             order by created_at, id
+             limit $2
+           ),
+           dl as (
+             delete from public.whatsapp_messages_log m
+             using doomed d
+             where m.queue_id = d.id
+           )
+           delete from public.whatsapp_queue q
+           using doomed d
+           where q.id = d.id`,
+          [new Date(failCut).toISOString(), CLEANUP_BATCH]
+        )
+        const n2 = r2.rowCount ?? 0
+        if (n2 > 0) {
+          logger.info(
+            {
+              tenantId,
+              deleted: n2,
+              cutoff: new Date(failCut).toISOString(),
+              kind: 'failed_batch'
+            },
+            '[wa-worker] cleanup old terminal rows'
+          )
+        }
+      })
+    } catch (err) {
+      logger.error(
         {
-          deleted: n1,
-          cutoff: new Date(sentCut).toISOString(),
-          kind: 'sent_skipped_batch'
+          tenantId,
+          err: err instanceof Error ? err.message : String(err)
         },
-        '[wa-worker] cleanup old terminal rows'
+        '[wa-worker] cleanup batch failed'
       )
     }
-    const r2 = await pool.query(
-      `with doomed as (
-         select id
-         from public.whatsapp_queue
-         where status = 'failed'
-           and created_at < ($1::timestamptz)
-         order by created_at, id
-         limit $2
-       ),
-       dl as (
-         delete from public.whatsapp_messages_log m
-         using doomed d
-         where m.queue_id = d.id
-       )
-       delete from public.whatsapp_queue q
-       using doomed d
-       where q.id = d.id`,
-      [new Date(failCut).toISOString(), CLEANUP_BATCH]
-    )
-    const n2 = r2.rowCount ?? 0
-    if (n2 > 0) {
-      logger.info(
-        {
-          deleted: n2,
-          cutoff: new Date(failCut).toISOString(),
-          kind: 'failed_batch'
-        },
-        '[wa-worker] cleanup old terminal rows'
-      )
-    }
-  } catch (err) {
-    logger.error(
-      { err: err instanceof Error ? err.message : String(err) },
-      '[wa-worker] cleanup batch failed'
-    )
   }
 }
 
 async function claimNextQueueRows () {
-  const res = await pool.query(
-    `with cte as (
-       select id
-       from public.whatsapp_queue
-       where status = 'pending'
-         and scheduled_at <= now ()
-       order by scheduled_at asc, id asc
-       limit $1
-       for update skip locked
-     )
-     update public.whatsapp_queue q
-     set status = 'processing',
-         processing_started_at = now (),
-         processing_owner = $2,
-         last_attempt_at = now ()
-     from cte
-     where q.id = cte.id
-     returning q.id,
-               q.tenant_id,
-               q.recipient_phone,
-               q.message_type,
-               q.recipient_type,
-               q.message_body,
-               q.retry_count,
-               q.session_id`,
-    [queueBatchSize, WORKER_INSTANCE_ID]
-  )
-  return res.rows
+  const claimed = []
+  const tenantIds = await listWhatsappWorkerTenantIds()
+  for (const tenantId of tenantIds) {
+    if (claimed.length >= queueBatchSize) break
+    const remaining = queueBatchSize - claimed.length
+    try {
+      const res = await withTenantTxn(tenantId, (client) =>
+        client.query(
+          `with cte as (
+             select id
+             from public.whatsapp_queue
+             where status = 'pending'
+               and scheduled_at <= now ()
+             order by scheduled_at asc, id asc
+             limit $1
+             for update skip locked
+           )
+           update public.whatsapp_queue q
+           set status = 'processing',
+               processing_started_at = now (),
+               processing_owner = $2,
+               last_attempt_at = now ()
+           from cte
+           where q.id = cte.id
+           returning q.id,
+                     q.tenant_id,
+                     q.recipient_phone,
+                     q.message_type,
+                     q.recipient_type,
+                     q.message_body,
+                     q.retry_count,
+                     q.session_id`,
+          [remaining, WORKER_INSTANCE_ID]
+        )
+      )
+      for (const row of res.rows ?? []) claimed.push(row)
+    } catch (err) {
+      logger.error(
+        {
+          tenantId,
+          err: err instanceof Error ? err.message : String(err)
+        },
+        '[wa-worker] claimNextQueueRows tenant failed'
+      )
+    }
+  }
+  return claimed
 }
 
 /** Errors that will never resolve by retrying the same row — fail immediately. */
@@ -2045,20 +2064,32 @@ async function processClaimedQueueRow (row) {
     await sendOnce(row)
     resetSessionFailures(row.tenant_id)
     const sentAt = new Date().toISOString()
-    const fin = await pool.query(
-      `update public.whatsapp_queue
-       set status = 'sent',
-           sent_at = $1::timestamptz,
-           error = null,
-           processing_started_at = null,
-           processing_owner = null,
-           processing_recovery_count = 0,
-           last_attempt_at = now()
-       where id = $2::uuid
-         and processing_owner = $3
-         and status = 'processing'`,
-      [sentAt, row.id, WORKER_INSTANCE_ID]
-    )
+    const fin = await withTenantTxn(row.tenant_id, async (client) => {
+      const result = await client.query(
+        `update public.whatsapp_queue
+         set status = 'sent',
+             sent_at = $1::timestamptz,
+             error = null,
+             processing_started_at = null,
+             processing_owner = null,
+             processing_recovery_count = 0,
+             last_attempt_at = now()
+         where id = $2::uuid
+           and processing_owner = $3
+           and status = 'processing'`,
+        [sentAt, row.id, WORKER_INSTANCE_ID]
+      )
+      if (result.rowCount > 0) {
+        await client.query(
+          `update public.whatsapp_messages_log
+           set status = 'sent',
+               error = null
+           where queue_id = $1::uuid`,
+          [row.id]
+        )
+      }
+      return result
+    })
     if (!(fin.rowCount > 0)) {
       logger.warn(
         { queueId: row.id },
@@ -2066,13 +2097,6 @@ async function processClaimedQueueRow (row) {
       )
       return
     }
-    await pool.query(
-      `update public.whatsapp_messages_log
-       set status = 'sent',
-           error = null
-       where queue_id = $1::uuid`,
-      [row.id]
-    )
     logger.info({ queueId: row.id }, '[wa-worker] DB updated: sent')
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
@@ -2140,31 +2164,34 @@ async function processClaimedQueueRow (row) {
       },
       '[wa-worker] send failed'
     )
-    if (failed) {
-      const uq = await pool.query(
-        `update public.whatsapp_queue
-         set status = 'failed',
-             error = $1,
-             retry_count = $2,
-             processing_started_at = null,
-             processing_owner = null,
-             last_attempt_at = now()
-         where id = $3::uuid
-           and processing_owner = $4
-           and status = 'processing'`,
-        [msg, rc, row.id, WORKER_INSTANCE_ID]
-      )
-      if (uq.rowCount > 0) {
-        await pool.query(
-          `update public.whatsapp_messages_log
+    await withTenantTxn(row.tenant_id, async (client) => {
+      if (failed) {
+        const uq = await client.query(
+          `update public.whatsapp_queue
            set status = 'failed',
-               error = $1
-           where queue_id = $2::uuid`,
-          [msg, row.id]
+               error = $1,
+               retry_count = $2,
+               processing_started_at = null,
+               processing_owner = null,
+               last_attempt_at = now()
+           where id = $3::uuid
+             and processing_owner = $4
+             and status = 'processing'`,
+          [msg, rc, row.id, WORKER_INSTANCE_ID]
         )
+        if (uq.rowCount > 0) {
+          await client.query(
+            `update public.whatsapp_messages_log
+             set status = 'failed',
+                 error = $1
+             where queue_id = $2::uuid`,
+            [msg, row.id]
+          )
+        }
+        return
       }
-    } else {
-      const uq = await pool.query(
+
+      const uq = await client.query(
         `update public.whatsapp_queue
          set status = 'pending',
              error = $1,
@@ -2179,7 +2206,7 @@ async function processClaimedQueueRow (row) {
         [msg, rc, nextSched, row.id, WORKER_INSTANCE_ID]
       )
       if (uq.rowCount > 0) {
-        await pool.query(
+        await client.query(
           `update public.whatsapp_messages_log
            set status = 'pending',
                error = $1
@@ -2187,7 +2214,7 @@ async function processClaimedQueueRow (row) {
           [msg, row.id]
         )
       }
-    }
+    })
   }
 }
 
