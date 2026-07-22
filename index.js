@@ -34,11 +34,42 @@ import makeWASocket, {
 import pino from 'pino'
 
 const logLevel = (process.env.WA_WORKER_LOG_LEVEL || 'info').trim().toLowerCase()
-const logBodies = logLevel === 'debug'
 const logDebug = logLevel === 'debug'
 
 const logger = pino({
-  level: logLevel === 'debug' ? 'debug' : logLevel === 'warn' ? 'warn' : 'info'
+  level: logLevel === 'debug' ? 'debug' : logLevel === 'warn' ? 'warn' : 'info',
+  redact: {
+    paths: [
+      'authorization',
+      'body',
+      'cookie',
+      'credential',
+      'databaseUrl',
+      'headers',
+      'password',
+      'payload',
+      'privateKey',
+      'query',
+      'requestBody',
+      'responseBody',
+      'secret',
+      'token',
+      '*.authorization',
+      '*.body',
+      '*.cookie',
+      '*.credential',
+      '*.headers',
+      '*.password',
+      '*.payload',
+      '*.privateKey',
+      '*.query',
+      '*.requestBody',
+      '*.responseBody',
+      '*.secret',
+      '*.token'
+    ],
+    censor: '[redacted]'
+  }
 })
 
 /** Human-readable Baileys disconnect code (see DisconnectReason in @whiskeysockets/baileys) */
@@ -135,7 +166,7 @@ const CLEANUP_EVERY_N_POLLS = Math.max(1, Number(process.env.WA_QUEUE_CLEANUP_EV
 const DAY_MS = 86_400_000
 
 if (!databaseUrl) {
-  console.error('Missing DATABASE_URL')
+  logger.fatal({ msg: 'missing_database_url' }, '[wa-worker] missing DATABASE_URL')
   process.exit(1)
 }
 
@@ -725,9 +756,7 @@ function isPermanentSendError (msg) {
 
 function previewBody (text, max = 160) {
   const s = String(text ?? '')
-  if (logBodies) return s
-  if (s.length <= max) return s
-  return `${s.slice(0, max)}…`
+  return `[redacted-body:${Math.min(s.length, max)}-of-${s.length}]`
 }
 
 /** jsonb columns on whatsapp_sessions — node-pg treats JS arrays as PG arrays, not JSON */
@@ -1039,6 +1068,8 @@ async function startSocketInner (tenantId, ctx) {
   if (logDebug) {
     logger.debug({ tenantId, authDir, mode: ctx.mode }, '[wa-worker] useMultiFileAuthState')
   }
+  // Baileys names this state loader like a React hook, but it is a Node API.
+  // eslint-disable-next-line react-hooks/rules-of-hooks
   const { state, saveCreds } = await useMultiFileAuthState(authDir)
   const sockOptions = {
     logger: pino({
